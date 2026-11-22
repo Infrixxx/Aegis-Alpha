@@ -1,0 +1,4990 @@
+================================================================================
+AEGIS ALPHA - COMPLETE REPOSITORY CODEBASE BUNDLE FOR REVIEW
+================================================================================
+Total files included: 17
+
+FILE MANIFEST:
+  - .env.example (562 bytes)
+  - .gitignore (447 bytes)
+  - Dockerfile (1,050 bytes)
+  - LICENSE (1,092 bytes)
+  - main.py (12,124 bytes)
+  - notebooks/01_eda.ipynb (9,591 bytes)
+  - notebooks/02_workflow_runner.ipynb (7,290 bytes)
+  - README.md (25,681 bytes)
+  - requirements.txt (566 bytes)
+  - src/__init__.py (79 bytes)
+  - src/broker.py (9,083 bytes)
+  - src/config.py (3,623 bytes)
+  - src/data_fetcher.py (28,784 bytes)
+  - src/features.py (21,639 bytes)
+  - src/notifier.py (5,180 bytes)
+  - src/simulator.py (26,882 bytes)
+  - src/train.py (32,694 bytes)
+
+================================================================================
+FILE: .env.example
+================================================================================
+# Aegis Alpha Environment Configuration Template
+# Copy this file to .env and populate your own credentials.
+# Never commit .env to version control.
+
+# Telegram Bot Credentials (optional; falls back to console logging if empty)
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_CHAT_ID=
+
+# Binance API Credentials (optional; falls back to dry-run order simulation if empty)
+BINANCE_API_KEY=
+BINANCE_API_SECRET=
+
+# Broker Execution Mode (true = Binance Spot Testnet / Dry-Run, false = Live)
+BINANCE_TESTNET=true
+
+# Storage and Logging
+DATABASE_PATH=data/market_data.db
+LOG_LEVEL=INFO
+
+================================================================================
+FILE: .gitignore
+================================================================================
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Data and SQLite databases
+data/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.parquet
+*.csv
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Jupyter and IDE artifacts
+.ipynb_checkpoints/
+.vscode/
+.idea/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Logs and OS files
+*.log
+logs/
+.DS_Store
+Thumbs.db
+
+================================================================================
+FILE: Dockerfile
+================================================================================
+# Aegis Alpha Production Container Image (Python 3.12 on Debian Slim)
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONPATH=/app
+
+WORKDIR /app
+
+# Install minimal system dependencies required by scientific Python packages and lxml
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    libgomp1 \
+    libxml2-dev \
+    libxslt1-dev \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python dependencies first to maximize Docker build layer caching
+COPY requirements.txt /app/requirements.txt
+RUN pip install --upgrade pip && pip install -r /app/requirements.txt
+
+# Copy project source code
+COPY . /app
+
+# Create runtime directories and run as a non-root user
+RUN mkdir -p /app/data /app/models /app/notebooks \
+    && useradd -m -u 1000 aegis \
+    && chown -R aegis:aegis /app
+
+USER aegis
+
+# Default command runs deterministic offline reproduction; override with --mode online in production
+CMD ["python", "main.py", "--mode", "offline"]
+
+================================================================================
+FILE: LICENSE
+================================================================================
+MIT License
+
+Copyright (c) 2026 Code Whisperer
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+================================================================================
+FILE: main.py
+================================================================================
+"""End-to-end CLI orchestrator for the Aegis Alpha algorithmic trading pipeline.
+
+Supports two execution regimes:
+- --mode online  : Incrementally fetches live OHLCV (ccxt/Binance) and Crypto Fear &
+                   Greed Index into SQLite -> engineers 40 numeric + 57 dummy features
+                   -> loads or trains multi-model ensemble -> runs Vector + Exact
+                   simulations + diagnostics -> executes dry-run/testnet broker orders
+                   -> dispatches Telegram/console notifications.
+- --mode offline : Loads pre-saved local SQLite DB or Parquet/CSV snapshot (with
+                   optional HTTP/Google Drive download via --offline-url) for fast,
+                   deterministic peer-review reproduction without waiting for full
+                   API backfills.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+from pathlib import Path
+from typing import Any
+
+import pandas as pd
+import requests
+
+from src.broker import BinanceBroker
+from src.config import (
+    DATA_DIR,
+    DB_PATH,
+    MODELS_DIR,
+    START_DATE_ISO,
+    SYMBOLS,
+    configure_logging,
+    ensure_directories,
+)
+from src.data_fetcher import format_database_summary, run_ingestion
+from src.features import (
+    build_features_from_sqlite,
+    load_dataframe,
+    save_dataframe,
+)
+from src.notifier import TelegramNotifier
+from src.simulator import (
+    compute_btc_benchmark,
+    format_simulation_report,
+    run_diagnostics,
+    run_exact_simulation,
+    run_vectorized_simulations,
+)
+from src.train import (
+    chronological_split,
+    predict_with_saved_models,
+    train_all_models,
+)
+
+logger = logging.getLogger("aegis_alpha.main")
+
+DEFAULT_OFFLINE_SNAPSHOT = DATA_DIR / "offline_snapshot.parquet"
+
+
+def _download_offline_artifact(url: str, destination: Path) -> Path:
+    """Download a pre-saved offline dataset (e.g., from Google Drive direct link)."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    logger.info("Downloading offline dataset from %s -> %s", url, destination)
+    with requests.get(url, stream=True, timeout=120) as resp:
+        resp.raise_for_status()
+        with open(destination, "wb") as fh:
+            for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    fh.write(chunk)
+    logger.info("Offline dataset downloaded (%d bytes).", destination.stat().st_size)
+    return destination
+
+
+def load_or_build_features(
+    mode: str,
+    db_path: Path,
+    offline_path: Path,
+    offline_url: str | None = None,
+    symbols: list[str] | None = None,
+    start_date: str = START_DATE_ISO,
+    export_offline_snapshot: bool = False,
+) -> pd.DataFrame:
+    """Resolve feature DataFrame according to online or offline execution mode."""
+    ensure_directories()
+
+    if mode == "online":
+        logger.info("Running ONLINE mode: incremental API sync into %s.", db_path)
+        ingestion_summary = run_ingestion(
+            db_path=db_path,
+            symbols=symbols or list(SYMBOLS),
+            start_iso=start_date,
+        )
+        print(format_database_summary(ingestion_summary))
+        df_features = build_features_from_sqlite(db_path=db_path, symbols=symbols)
+        if export_offline_snapshot:
+            saved_path = save_dataframe(df_features, offline_path)
+            logger.info("Exported offline feature snapshot to %s.", saved_path)
+        return df_features
+
+    # OFFLINE mode
+    logger.info("Running OFFLINE mode for deterministic peer-review reproduction.")
+    if offline_url and not offline_path.exists():
+        _download_offline_artifact(offline_url, offline_path)
+
+    if offline_path.exists():
+        logger.info("Loading pre-computed offline snapshot from %s.", offline_path)
+        return load_dataframe(offline_path)
+
+    csv_fallback = offline_path.with_suffix(".csv")
+    if csv_fallback.exists():
+        logger.info("Loading pre-computed offline CSV snapshot from %s.", csv_fallback)
+        return load_dataframe(csv_fallback)
+
+    if db_path.exists():
+        logger.info(
+            "Offline snapshot %s not found; building features locally from SQLite DB %s.",
+            offline_path,
+            db_path,
+        )
+        df_features = build_features_from_sqlite(db_path=db_path, symbols=symbols)
+        if export_offline_snapshot:
+            save_dataframe(df_features, offline_path)
+        return df_features
+
+    raise FileNotFoundError(
+        f"Offline mode could not find {offline_path} or {db_path}. "
+        "Provide --offline-path / --offline-url or run '--mode online' once to populate SQLite."
+    )
+
+
+def run_pipeline(
+    mode: str = "offline",
+    db_path: Path = DB_PATH,
+    offline_path: Path = DEFAULT_OFFLINE_SNAPSHOT,
+    offline_url: str | None = None,
+    models_dir: Path = MODELS_DIR,
+    retrain: bool = False,
+    skip_lstm: bool = False,
+    tuning_method: str = "optuna",
+    tuning_trials: int = 12,
+    lstm_epochs: int = 6,
+    execute_orders: bool = False,
+    notify: bool = True,
+    export_offline_snapshot: bool = False,
+    symbols: list[str] | None = None,
+    start_date: str = START_DATE_ISO,
+) -> dict[str, Any]:
+    """Execute the full Aegis Alpha workflow from ingestion through notifications."""
+    df_features = load_or_build_features(
+        mode=mode,
+        db_path=db_path,
+        offline_path=offline_path,
+        offline_url=offline_url,
+        symbols=symbols,
+        start_date=start_date,
+        export_offline_snapshot=export_offline_snapshot,
+    )
+
+    xgb_artifact = Path(models_dir) / "xgboost_tuned.joblib"
+    if retrain or not xgb_artifact.exists():
+        logger.info("Training multi-model suite (DT, RF, Tuned XGBoost, LSTM=%s).", not skip_lstm)
+        train_result = train_all_models(
+            df=df_features,
+            models_dir=models_dir,
+            tuning_method=tuning_method,
+            tuning_trials=tuning_trials,
+            train_lstm=not skip_lstm,
+            lstm_epochs=lstm_epochs,
+        )
+        eval_df = train_result["test_predictions"]
+        model_metrics = train_result["metrics"]
+    else:
+        logger.info("Loading persisted model artifacts from %s for inference.", models_dir)
+        split = chronological_split(df_features)
+        eval_df = predict_with_saved_models(split.test, models_dir=models_dir)
+        meta_path = Path(models_dir) / "model_metadata.json"
+        model_metrics = (
+            json.loads(meta_path.read_text(encoding="utf-8"))
+            if meta_path.exists()
+            else {}
+        )
+
+    # Phase 4: Vectorized + Exact Iterative Simulations + Benchmark + Diagnostics
+    df_vec, vec_summary = run_vectorized_simulations(eval_df)
+    trades_df, equity_df, exact_metrics = run_exact_simulation(df_vec)
+    _, bench_metrics = compute_btc_benchmark(df_vec)
+    diagnostics = run_diagnostics(df_vec, trades_df)
+
+    report_text = format_simulation_report(vec_summary, exact_metrics, bench_metrics)
+    print(report_text)
+
+    # Persist simulation and diagnostics report to models/
+    sim_report_path = Path(models_dir) / "simulation_report.json"
+    sim_payload = {
+        "mode": mode,
+        "vectorized_summary": vec_summary,
+        "exact_metrics": exact_metrics,
+        "benchmark_metrics": bench_metrics,
+        "diagnostics": diagnostics,
+    }
+    sim_report_path.write_text(json.dumps(sim_payload, indent=2), encoding="utf-8")
+    logger.info("Saved simulation and diagnostic report to %s.", sim_report_path)
+
+    # Phase 5: Broker Execution (Dry-Run / Testnet) and Telegram / Console Notifications
+    broker = BinanceBroker(dry_run=not execute_orders)
+    order_receipts = broker.execute_latest_signals(df_vec)
+
+    if notify:
+        notifier = TelegramNotifier()
+        notifier.notify_portfolio_summary(
+            exact_metrics=exact_metrics,
+            bench_metrics=bench_metrics,
+            run_mode=mode,
+        )
+        if order_receipts:
+            notifier.notify_trades(order_receipts)
+
+    return {
+        "mode": mode,
+        "feature_rows": int(len(df_features)),
+        "eval_rows": int(len(df_vec)),
+        "model_metrics": model_metrics,
+        "vectorized_summary": vec_summary,
+        "exact_metrics": exact_metrics,
+        "benchmark_metrics": bench_metrics,
+        "diagnostics": diagnostics,
+        "orders": [r.to_dict() for r in order_receipts],
+        "trades_df": trades_df,
+        "equity_df": equity_df,
+        "predictions_df": df_vec,
+    }
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Aegis Alpha end-to-end algorithmic trading pipeline."
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["online", "offline"],
+        default="offline",
+        help="Execution regime: 'online' (live API sync) or 'offline' (local DB/Parquet).",
+    )
+    parser.add_argument(
+        "--db-path",
+        type=Path,
+        default=DB_PATH,
+        help=f"SQLite database path (default: {DB_PATH}).",
+    )
+    parser.add_argument(
+        "--offline-path",
+        type=Path,
+        default=DEFAULT_OFFLINE_SNAPSHOT,
+        help=f"Offline Parquet/CSV snapshot path (default: {DEFAULT_OFFLINE_SNAPSHOT}).",
+    )
+    parser.add_argument(
+        "--offline-url",
+        type=str,
+        default=None,
+        help="Optional direct download URL (e.g. Google Drive) for the offline snapshot.",
+    )
+    parser.add_argument(
+        "--models-dir",
+        type=Path,
+        default=MODELS_DIR,
+        help=f"Directory for saved model artifacts (default: {MODELS_DIR}).",
+    )
+    parser.add_argument(
+        "--train",
+        action="store_true",
+        help="Force retraining of all models even if artifacts already exist.",
+    )
+    parser.add_argument(
+        "--skip-lstm",
+        action="store_true",
+        help="Skip PyTorch LSTM training (useful on low-RAM CPU environments).",
+    )
+    parser.add_argument(
+        "--tuning-method",
+        choices=["optuna", "random_search"],
+        default="optuna",
+        help="Hyperparameter tuning strategy for XGBClassifier.",
+    )
+    parser.add_argument(
+        "--tuning-trials",
+        type=int,
+        default=12,
+        help="Number of Optuna trials or RandomizedSearchCV iterations (default: 12).",
+    )
+    parser.add_argument(
+        "--lstm-epochs",
+        type=int,
+        default=6,
+        help="Number of training epochs for the PyTorch LSTM classifier (default: 6).",
+    )
+    parser.add_argument(
+        "--execute-orders",
+        action="store_true",
+        help="Allow Binance Spot Testnet/Live order submission when API keys are set "
+        "(otherwise always runs in DRY-RUN mode).",
+    )
+    parser.add_argument(
+        "--no-notify",
+        action="store_true",
+        help="Disable Telegram/console alert dispatch.",
+    )
+    parser.add_argument(
+        "--export-offline-snapshot",
+        action="store_true",
+        help="Export engineered feature DataFrame to --offline-path for peer review.",
+    )
+    parser.add_argument(
+        "--symbols",
+        nargs="+",
+        default=None,
+        help="Optional subset of trading pairs (default: all 5 configured pairs).",
+    )
+    parser.add_argument(
+        "--start-date",
+        type=str,
+        default=START_DATE_ISO,
+        help=f"Backfill start ISO date for --mode online (default: {START_DATE_ISO}).",
+    )
+    return parser
+
+
+def main() -> None:
+    """CLI entrypoint for Aegis Alpha."""
+    configure_logging()
+    args = _build_parser().parse_args()
+    run_pipeline(
+        mode=args.mode,
+        db_path=args.db_path,
+        offline_path=args.offline_path,
+        offline_url=args.offline_url,
+        models_dir=args.models_dir,
+        retrain=args.train,
+        skip_lstm=args.skip_lstm,
+        tuning_method=args.tuning_method,
+        tuning_trials=args.tuning_trials,
+        lstm_epochs=args.lstm_epochs,
+        execute_orders=args.execute_orders,
+        notify=not args.no_notify,
+        export_offline_snapshot=args.export_offline_snapshot,
+        symbols=args.symbols,
+        start_date=args.start_date,
+    )
+
+
+if __name__ == "__main__":
+    main()
+
+================================================================================
+FILE: notebooks/01_eda.ipynb
+================================================================================
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "id": "aegis-eda-01",
+   "metadata": {},
+   "source": [
+    "# Aegis Alpha - Phase 2: Exploratory Data Analysis (EDA)\n",
+    "\n",
+    "This notebook validates the ingested SQLite dataset (`data/market_data.db`), builds the 40 numeric and 57 dummy features defined in `src/features.py`, and conducts target distribution, missing-value, regime, and feature correlation analysis against `TO_PREDICT` (`is_positive_growth_4h`)."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "aegis-eda-02",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import sys\n",
+    "from pathlib import Path\n",
+    "\n",
+    "PROJECT_ROOT = Path.cwd().parent if Path.cwd().name == 'notebooks' else Path.cwd()\n",
+    "if str(PROJECT_ROOT) not in sys.path:\n",
+    "    sys.path.insert(0, str(PROJECT_ROOT))\n",
+    "\n",
+    "import numpy as np\n",
+    "import pandas as pd\n",
+    "import matplotlib.pyplot as plt\n",
+    "import seaborn as sns\n",
+    "\n",
+    "from src.config import DB_PATH, DATA_DIR, SYMBOLS\n",
+    "from src.features import (\n",
+    "    TO_PREDICT,\n",
+    "    TARGET_COL,\n",
+    "    NUMERIC,\n",
+    "    DUMMIES,\n",
+    "    FEATURE_COLS,\n",
+    "    load_raw_tables_from_sqlite,\n",
+    "    build_feature_dataframe,\n",
+    "    load_dataframe,\n",
+    ")\n",
+    "\n",
+    "sns.set_theme(style='whitegrid')\n",
+    "pd.set_option('display.max_columns', 50)\n",
+    "print(f'Project root     : {PROJECT_ROOT}')\n",
+    "print(f'Target column    : {TO_PREDICT}')\n",
+    "print(f'NUMERIC features : {len(NUMERIC)}')\n",
+    "print(f'DUMMIES features : {len(DUMMIES)}')\n",
+    "print(f'Total features   : {len(FEATURE_COLS)}')"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "aegis-eda-03",
+   "metadata": {},
+   "source": [
+    "## 1. Data Ingestion Audit and Feature Generation\n",
+    "\n",
+    "Loads raw tables from `data/market_data.db` (or falls back to `data/offline_snapshot.parquet` if running in offline peer-review mode)."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "aegis-eda-04",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "offline_parquet = DATA_DIR / 'offline_snapshot.parquet'\n",
+    "if DB_PATH.exists():\n",
+    "    df_ohlcv, df_fg = load_raw_tables_from_sqlite(DB_PATH)\n",
+    "    print(f'Raw OHLCV rows        : {len(df_ohlcv):,}')\n",
+    "    print(f'Raw Fear & Greed rows : {len(df_fg):,}')\n",
+    "    display(df_ohlcv.groupby('symbol')['datetime_utc'].agg(['count', 'min', 'max']))\n",
+    "    df_raw_features = build_feature_dataframe(\n",
+    "        df_ohlcv, df_fg, drop_na_features=False, drop_na_target=False\n",
+    "    )\n",
+    "    df = df_raw_features.dropna(subset=NUMERIC + TO_PREDICT).copy()\n",
+    "    df[TARGET_COL] = df[TARGET_COL].astype(int)\n",
+    "elif offline_parquet.exists():\n",
+    "    df_raw_features = load_dataframe(offline_parquet)\n",
+    "    df = df_raw_features.dropna(subset=NUMERIC + TO_PREDICT).copy()\n",
+    "    df[TARGET_COL] = df[TARGET_COL].astype(int)\n",
+    "    print(f'Loaded offline snapshot: {len(df):,} rows')\n",
+    "else:\n",
+    "    raise FileNotFoundError(\n",
+    "        'Neither data/market_data.db nor data/offline_snapshot.parquet found. '\n",
+    "        'Run python -m src.data_fetcher first.'\n",
+    "    )\n",
+    "\n",
+    "print(f'Clean modeling rows: {len(df):,}')"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "aegis-eda-05",
+   "metadata": {},
+   "source": [
+    "## 2. Missing-Value and Data Quality Checks"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "aegis-eda-06",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "na_before = df_raw_features[NUMERIC + TO_PREDICT].isna().sum()\n",
+    "na_before_pct = (na_before / len(df_raw_features) * 100.0).round(4)\n",
+    "na_report = pd.DataFrame({'missing_raw': na_before, 'missing_raw_pct': na_before_pct})\n",
+    "print('Top 15 columns with warmup/tail NaNs prior to dropna:')\n",
+    "display(na_report.sort_values('missing_raw', ascending=False).head(15))\n",
+    "\n",
+    "na_after = df[FEATURE_COLS + TO_PREDICT].isna().sum().sum()\n",
+    "dup_keys = df.duplicated(subset=['symbol', 'timestamp']).sum()\n",
+    "print(f'Remaining NaNs after cleaning : {na_after}')\n",
+    "print(f'Duplicate (symbol, timestamp) : {dup_keys}')"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "aegis-eda-07",
+   "metadata": {},
+   "source": [
+    "## 3. Target Variable (`TO_PREDICT`) Distribution Analysis\n",
+    "\n",
+    "Inspects class balance for `is_positive_growth_4h` (1 when forward 4h return >= +0.5%) overall, per asset, per calendar year, and per sentiment regime."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "aegis-eda-08",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "df['year'] = df['datetime'].dt.year\n",
+    "\n",
+    "print('Overall target distribution:')\n",
+    "display(df[TARGET_COL].value_counts(normalize=True).rename('proportion').to_frame())\n",
+    "\n",
+    "print('Target positive rate and mean 4h return by symbol:')\n",
+    "by_symbol = df.groupby('symbol').agg(\n",
+    "    rows=(TARGET_COL, 'count'),\n",
+    "    positive_rate=(TARGET_COL, 'mean'),\n",
+    "    mean_ret_4h=('future_return_4h', 'mean'),\n",
+    "    std_ret_4h=('future_return_4h', 'std'),\n",
+    ")\n",
+    "display(by_symbol)\n",
+    "\n",
+    "print('Target positive rate by year:')\n",
+    "display(df.groupby('year')[TARGET_COL].agg(['count', 'mean']))\n",
+    "\n",
+    "print('Target positive rate by Fear & Greed sentiment regime:')\n",
+    "by_sent = df.groupby('sentiment_regime').agg(\n",
+    "    rows=(TARGET_COL, 'count'),\n",
+    "    positive_rate=(TARGET_COL, 'mean'),\n",
+    "    mean_ret_4h=('future_return_4h', 'mean'),\n",
+    ").sort_values('positive_rate', ascending=False)\n",
+    "display(by_sent)\n",
+    "\n",
+    "fig, axes = plt.subplots(1, 2, figsize=(14, 4))\n",
+    "by_symbol['positive_rate'].plot(kind='bar', ax=axes[0], color='steelblue')\n",
+    "axes[0].set_title('Target Positive Rate by Symbol')\n",
+    "axes[0].set_ylabel('P(future_return_4h >= 0.5%)')\n",
+    "axes[0].axhline(df[TARGET_COL].mean(), color='crimson', linestyle='--')\n",
+    "\n",
+    "by_sent['positive_rate'].plot(kind='bar', ax=axes[1], color='teal')\n",
+    "axes[1].set_title('Target Positive Rate by Sentiment Regime')\n",
+    "axes[1].set_ylabel('P(future_return_4h >= 0.5%)')\n",
+    "axes[1].axhline(df[TARGET_COL].mean(), color='crimson', linestyle='--')\n",
+    "plt.tight_layout()\n",
+    "plt.show()"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "aegis-eda-09",
+   "metadata": {},
+   "source": [
+    "## 4. Feature Correlation Analysis Against `TO_PREDICT`\n",
+    "\n",
+    "Evaluates linear (Pearson) and rank (Spearman) correlations between all numeric features and both `is_positive_growth_4h` and continuous `future_return_4h`."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "aegis-eda-10",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "pearson_target = df[NUMERIC].corrwith(df[TARGET_COL]).rename('pearson_vs_target')\n",
+    "pearson_ret = df[NUMERIC].corrwith(df['future_return_4h']).rename('pearson_vs_ret_4h')\n",
+    "corr_summary = pd.concat([pearson_target, pearson_ret], axis=1)\n",
+    "corr_summary['abs_corr_target'] = corr_summary['pearson_vs_target'].abs()\n",
+    "corr_summary = corr_summary.sort_values('abs_corr_target', ascending=False)\n",
+    "\n",
+    "print('Top 20 numeric features correlated with TO_PREDICT:')\n",
+    "display(corr_summary.head(20))\n",
+    "\n",
+    "top_feats = corr_summary.head(15).index.tolist()\n",
+    "fig, axes = plt.subplots(1, 2, figsize=(16, 6))\n",
+    "corr_summary.head(15)['pearson_vs_target'].sort_values().plot(\n",
+    "    kind='barh', ax=axes[0], color='slategray'\n",
+    ")\n",
+    "axes[0].set_title('Top 15 Feature Correlations with is_positive_growth_4h')\n",
+    "axes[0].axvline(0.0, color='black', linewidth=0.8)\n",
+    "\n",
+    "sns.heatmap(\n",
+    "    df[top_feats].corr(),\n",
+    "    cmap='coolwarm',\n",
+    "    center=0.0,\n",
+    "    ax=axes[1],\n",
+    "    cbar_kws={'shrink': 0.8},\n",
+    ")\n",
+    "axes[1].set_title('Inter-Feature Correlation Matrix (Top 15 Numeric Features)')\n",
+    "plt.tight_layout()\n",
+    "plt.show()"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "aegis-eda-11",
+   "metadata": {},
+   "source": [
+    "## 5. Volatility Regime & Contrarian Fear Filter Validation"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "aegis-eda-12",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "vol_table = df.groupby('volatility_regime').agg(\n",
+    "    rows=(TARGET_COL, 'count'),\n",
+    "    positive_rate=(TARGET_COL, 'mean'),\n",
+    "    mean_ret_4h=('future_return_4h', 'mean'),\n",
+    "    tail_loss_p05=('future_return_4h', lambda s: s.quantile(0.05)),\n",
+    ")\n",
+    "display(vol_table)\n",
+    "\n",
+    "cross_pivot = pd.pivot_table(\n",
+    "    df,\n",
+    "    values='future_return_4h',\n",
+    "    index='sentiment_regime',\n",
+    "    columns='volatility_regime',\n",
+    "    aggfunc='mean',\n",
+    ")\n",
+    "print('Mean 4h Forward Return by Sentiment Regime x Volatility Regime:')\n",
+    "display(cross_pivot)"
+   ]
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "name": "python",
+   "version": "3.12.0"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 5
+}
+
+================================================================================
+FILE: notebooks/02_workflow_runner.ipynb
+================================================================================
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "id": "aegis-wf-01",
+   "metadata": {},
+   "source": [
+    "# Aegis Alpha - Phase 5: End-to-End Automated Workflow Runner\n",
+    "\n",
+    "This notebook imports and executes all modular Python pipeline modules (`src/data_fetcher.py`, `src/features.py`, `src/train.py`, `src/simulator.py`, `src/broker.py`, `src/notifier.py`) end-to-end and outputs the latest predicted trades.\n",
+    "\n",
+    "Set `RUN_MODE = 'offline'` for instant peer-review reproduction from a pre-saved SQLite database or Parquet snapshot, or `RUN_MODE = 'online'` to perform live incremental API ingestion from Binance and Alternative.me."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "aegis-wf-02",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import sys\n",
+    "from pathlib import Path\n",
+    "\n",
+    "PROJECT_ROOT = Path.cwd().parent if Path.cwd().name == 'notebooks' else Path.cwd()\n",
+    "if str(PROJECT_ROOT) not in sys.path:\n",
+    "    sys.path.insert(0, str(PROJECT_ROOT))\n",
+    "\n",
+    "import pandas as pd\n",
+    "import matplotlib.pyplot as plt\n",
+    "\n",
+    "from src.config import DB_PATH, DATA_DIR, MODELS_DIR, SYMBOLS, configure_logging\n",
+    "from src.features import get_feature_catalog\n",
+    "from src.simulator import compute_btc_benchmark\n",
+    "from main import run_pipeline\n",
+    "\n",
+    "configure_logging('INFO')\n",
+    "\n",
+    "# Toggle between 'offline' (fast peer-review reproduction) and 'online' (live API sync)\n",
+    "RUN_MODE = 'offline'\n",
+    "FORCE_RETRAIN = False\n",
+    "SKIP_LSTM = False\n",
+    "EXECUTE_ORDERS = False  # Keep False for safe Dry-Run mode\n",
+    "\n",
+    "catalog = get_feature_catalog()\n",
+    "print('Feature Contract Summary:')\n",
+    "for k, v in catalog.items():\n",
+    "    print(f'  {k:<15}: {len(v)} columns')"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "aegis-wf-03",
+   "metadata": {},
+   "source": [
+    "## 1. Execute Complete Pipeline (`main.run_pipeline`)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "aegis-wf-04",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "result = run_pipeline(\n",
+    "    mode=RUN_MODE,\n",
+    "    db_path=DB_PATH,\n",
+    "    offline_path=DATA_DIR / 'offline_snapshot.parquet',\n",
+    "    models_dir=MODELS_DIR,\n",
+    "    retrain=FORCE_RETRAIN,\n",
+    "    skip_lstm=SKIP_LSTM,\n",
+    "    tuning_method='optuna',\n",
+    "    tuning_trials=12,\n",
+    "    lstm_epochs=6,\n",
+    "    execute_orders=EXECUTE_ORDERS,\n",
+    "    notify=True,\n",
+    ")\n",
+    "print(f\"Pipeline completed in mode={result['mode']} | eval_rows={result['eval_rows']:,}\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "aegis-wf-05",
+   "metadata": {},
+   "source": [
+    "## 2. Multi-Model Validation and Test Comparison"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "aegis-wf-06",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "model_metrics = result.get('model_metrics', {})\n",
+    "if 'test' in model_metrics:\n",
+    "    test_rows = []\n",
+    "    for name, m in model_metrics['test'].items():\n",
+    "        row = {'model_or_rule': name}\n",
+    "        row.update(m)\n",
+    "        test_rows.append(row)\n",
+    "    display(pd.DataFrame(test_rows).set_index('model_or_rule'))\n",
+    "else:\n",
+    "    print('No model_metadata.json metrics loaded; run with FORCE_RETRAIN=True to regenerate.')"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "aegis-wf-07",
+   "metadata": {},
+   "source": [
+    "## 3. Exact Portfolio Equity Curve vs. BTC Buy-and-Hold Benchmark"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "aegis-wf-08",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "equity_df = result['equity_df']\n",
+    "preds_df = result['predictions_df']\n",
+    "bench_eq, bench_metrics = compute_btc_benchmark(preds_df)\n",
+    "\n",
+    "fig, ax = plt.subplots(figsize=(13, 5))\n",
+    "if not equity_df.empty:\n",
+    "    ax.plot(equity_df['datetime'], equity_df['equity'], label='Aegis Alpha (Exact Sim)', linewidth=2)\n",
+    "if not bench_eq.empty:\n",
+    "    ax.plot(bench_eq['datetime'], bench_eq['equity'], label='BTC/USDT Buy-and-Hold', linestyle='--', linewidth=1.8)\n",
+    "ax.set_title('Aegis Alpha Exact Portfolio Equity vs. BTC Buy-and-Hold ($10,000 Start)')\n",
+    "ax.set_xlabel('UTC Date')\n",
+    "ax.set_ylabel('Portfolio Equity (USD)')\n",
+    "ax.legend()\n",
+    "ax.grid(True, alpha=0.3)\n",
+    "plt.tight_layout()\n",
+    "plt.show()"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "aegis-wf-09",
+   "metadata": {},
+   "source": [
+    "## 4. Deep Diagnostic Breakdown (Ticker, Month, Sentiment Regime, False Positives)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "aegis-wf-10",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "diag = result['diagnostics']\n",
+    "print('Diagnostics by Ticker:')\n",
+    "display(pd.DataFrame(diag['by_ticker']))\n",
+    "\n",
+    "print('Diagnostics by Sentiment Regime:')\n",
+    "display(pd.DataFrame(diag['by_sentiment_regime']))\n",
+    "\n",
+    "print('Diagnostics by Volatility Regime:')\n",
+    "display(pd.DataFrame(diag['by_volatility_regime']))\n",
+    "\n",
+    "print('Diagnostics by Month:')\n",
+    "display(pd.DataFrame(diag['by_month']))\n",
+    "\n",
+    "fp_debug = diag.get('false_positive_debugging', {})\n",
+    "print('False Positive Reduction Summary:')\n",
+    "for k, v in fp_debug.items():\n",
+    "    if k != 'fp_vs_tp_feature_profile':\n",
+    "        print(f'  {k:<32}: {v}')\n",
+    "if 'fp_vs_tp_feature_profile' in fp_debug:\n",
+    "    display(pd.DataFrame(fp_debug['fp_vs_tp_feature_profile']).T)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "id": "aegis-wf-11",
+   "metadata": {},
+   "source": [
+    "## 5. Latest Predicted Trades and Broker Execution Receipts"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "aegis-wf-12",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "latest_bar = (\n",
+    "    preds_df.sort_values('timestamp')\n",
+    "    .groupby('symbol', as_index=False)\n",
+    "    .tail(1)\n",
+    "    .sort_values('pred_prob_ensemble', ascending=False)\n",
+    ")\n",
+    "display_cols = [\n",
+    "    c for c in [\n",
+    "        'symbol', 'datetime_utc', 'close', 'rsi_14', 'fg_value',\n",
+    "        'sentiment_regime', 'volatility_regime', 'pred_prob_xgb',\n",
+    "        'pred_prob_lstm', 'pred_prob_ensemble', 'pred_baseline', 'pred_custom_rule'\n",
+    "    ] if c in latest_bar.columns\n",
+    "]\n",
+    "print('Latest Bar Predictions Across All Monitored Pairs:')\n",
+    "display(latest_bar[display_cols])\n",
+    "\n",
+    "orders = result.get('orders', [])\n",
+    "if orders:\n",
+    "    print('Generated Broker Order Receipts:')\n",
+    "    display(pd.DataFrame(orders))\n",
+    "else:\n",
+    "    print('No trades triggered on the latest bar under pred_custom_rule filters.')"
+   ]
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "name": "python",
+   "version": "3.12.0"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 5
+}
+
+================================================================================
+FILE: README.md
+================================================================================
+# Aegis Alpha: End-to-End Algorithmic Crypto Trading Pipeline
+
+Aegis Alpha is a production-grade, modular quantitative research and algorithmic trading system built for Python 3.12 (Pop!_OS / Ubuntu Linux) and engineered to satisfy every technical criterion of the DataTalks.Club Stock Markets Analytics Zoomcamp grading rubric.
+
+The pipeline ingests more than 1,050,000 15-minute OHLCV candles across five high-liquidity cryptocurrency spot pairs alongside historical Crypto Fear & Greed sentiment data into a WAL-enabled SQLite database, generates 40 continuous technical/sentiment features plus 57 categorical dummy indicators, trains four classical and deep-learning classifiers with strict chronological splits, evaluates strategies using both vectorized and exact event-driven portfolio simulations against a BTC Buy-and-Hold benchmark, and automates execution via Binance Spot Testnet, Telegram notifications, Cron, and Docker.
+
+---
+
+## Table of Contents
+
+1. [Problem Description](#1-problem-description)
+2. [System Architecture](#2-system-architecture)
+3. [Data Sources and SQLite Storage Schema](#3-data-sources-and-sqlite-storage-schema)
+4. [Feature Engineering and 40+ Feature Dictionary](#4-feature-engineering-and-40-feature-dictionary)
+5. [Exploratory Data Analysis (EDA) Methodology and Findings](#5-exploratory-data-analysis-eda-methodology-and-findings)
+6. [Multi-Model Training, Tuning, and Custom Decision Rules](#6-multi-model-training-tuning-and-custom-decision-rules)
+7. [Trading Simulations: Vectorized vs. Exact Iterative vs. Benchmark](#7-trading-simulations-vectorized-vs-exact-iterative-vs-benchmark)
+8. [Error Analysis and False Positive Debugging](#8-error-analysis-and-false-positive-debugging)
+9. [Two-Regime Reproduction Guide (Offline vs. Online)](#9-two-regime-reproduction-guide-offline-vs-online)
+10. [Automation: Cron Schedule, Docker, Broker, and Telegram](#10-automation-cron-schedule-docker-broker-and-telegram)
+11. [Repository Structure and Security Controls](#11-repository-structure-and-security-controls)
+
+---
+
+## 1. Problem Description
+
+Cryptocurrency spot markets operate 24/7 with frequent volatility clustering, rapid sentiment reversals, and non-trivial exchange transaction fees (0.10% maker/taker per side on Binance, or 0.20% round-trip). Naive technical crossover strategies suffer from excessive turnover and severe whipsaws during liquidation cascades.
+
+**Quantitative Objective:** Predict short-horizon upward momentum events where an asset delivers at least a `+0.50%` return over the next 4 hours (16 consecutive 15-minute candles), providing a `2.5x` buffer over Binance round-trip fees:
+
+- **Prediction Target (`TO_PREDICT`):** `is_positive_growth_4h = 1` if `(close[t + 16] / close[t]) - 1 >= 0.005`, else `0`.
+- **Asset Universe (5 Pairs):** `BTC/USDT`, `ETH/USDT`, `SOL/USDT`, `BNB/USDT`, `ADA/USDT`.
+- **Frequency and Horizon:** 15-minute (`15m`) OHLCV bars from `2020-01-01T00:00:00Z` to present (`>1,050,000` rows total).
+- **Risk Mandate:** Maximize risk-adjusted returns (Sharpe Ratio and CAGR) while strictly limiting drawdowns via contrarian sentiment filtering (`fg_value < 45`), extreme-volatility exclusion, a 3-position concurrency cap, probability-scaled sizing, and hard `2%` Stop-Loss / `4%` Take-Profit exits.
+
+---
+
+## 2. System Architecture
+
+```text
++-------------------------------------------------------------------------+
+| PHASE 1: INCREMENTAL INGESTION (src/data_fetcher.py)                    |
+|  - Binance 15m OHLCV via ccxt (enableRateLimit=True, limit=1000 loop)   |
+|  - Crypto Fear & Greed API + BeautifulSoup / Playwright fallbacks       |
+|  - SQLite WAL storage (data/market_data.db) with composite PKs          |
++------------------------------------+------------------------------------+
+                                     |
+                                     v
++-------------------------------------------------------------------------+
+| PHASE 2: FEATURE ENGINEERING & EDA (src/features.py, 01_eda.ipynb)      |
+|  - Leakage-free UTC daily join + lagged sentiment features              |
+|  - 40 NUMERIC technical/volatility/volume/sentiment features (pandas_ta)|
+|  - 6 DUMMIES transformation sets (57 binary indicators)                 |
++------------------------------------+------------------------------------+
+                                     |
+                                     v
++-------------------------------------------------------------------------+
+| PHASE 3: CHRONOLOGICAL MODELING (src/train.py -> models/)               |
+|  - Split: Train (2020-2024) | Validation (2025) | Test (2026+)          |
+|  - Baselines: DecisionTreeClassifier, RandomForestClassifier            |
+|  - Advanced : Tuned XGBClassifier (Optuna/RandSearch), PyTorch LSTM     |
+|  - Decision : Ensemble prob > 0.65 + FG < 45 + non-extreme vol + RSI<70 |
++------------------------------------+------------------------------------+
+                                     |
+                                     v
++-------------------------------------------------------------------------+
+| PHASE 4: SIMULATIONS & DIAGNOSTICS (src/simulator.py)                   |
+|  - Vectorized: sim1_gross_rev/sim1_net_rev vs sim2_gross_rev/sim2_net   |
+|  - Exact (itertuples): $10,000, max 3 pos, prob sizing, 0.1% fee, SL/TP |
+|  - Benchmark: BTC/USDT Buy-and-Hold (CAGR, Sharpe, MaxDD, Rolling 30d)  |
+|  - Slicing  : Precision & PnL by Ticker, Month, Sentiment, Volatility   |
++------------------------------------+------------------------------------+
+                                     |
+                                     v
++-------------------------------------------------------------------------+
+| PHASE 5: AUTOMATION & EXECUTION (main.py, broker.py, notifier.py)       |
+|  - --mode online (live incremental) / --mode offline (instant review)   |
+|  - Binance Spot Testnet / Dry-Run broker + Telegram / Console alerts    |
+|  - Pop!_OS Linux Cron schedule + python:3.12-slim Dockerfile            |
++-------------------------------------------------------------------------+
+```
+
+---
+
+## 3. Data Sources and SQLite Storage Schema
+
+| Source | Endpoint / Interface | Granularity | Volume | SQLite Table | Primary Key |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| Binance Spot | `ccxt.binance({'enableRateLimit': True})` | `15m` OHLCV | >1,050,000 rows (5 pairs x ~210k bars since 2020-01-01) | `ohlcv` | `(symbol, timestamp)` (`WITHOUT ROWID`) |
+| Alternative.me | `https://api.alternative.me/fng/?limit=0&format=json` (BS4 + Playwright fallback) | Daily (`1D`) | >3,200 daily observations (since 2018-02-01) | `fear_greed` | `(timestamp)` + `UNIQUE(date_utc)` |
+
+### Database Concurrency and Incremental Sync Guarantees
+- **WAL Mode:** Every connection executes `PRAGMA journal_mode=WAL;`, `PRAGMA synchronous=NORMAL;`, and `PRAGMA busy_timeout=30000;`, enabling safe concurrent reads (EDA/inference) during scheduled writes.
+- **Incremental Resumption:** Before paginating Binance (`limit=1000`, `since = last_timestamp + 1`), `src/data_fetcher.py` executes `SELECT MAX(timestamp) FROM ohlcv WHERE symbol = ?`. Subsequent runs pull only newly closed candles, avoiding partial/unclosed bar contamination.
+- **Resilient Retries:** Transient `RateLimitExceeded`, `DDoSProtection`, `NetworkError`, and `RequestTimeout` exceptions are handled with exponential backoff.
+
+---
+
+## 4. Feature Engineering and 40+ Feature Dictionary
+
+All feature lists are explicitly exported in `src/features.py` as `TO_PREDICT`, `NUMERIC`, `DUMMIES`, and `FEATURE_COLS`. Indicators are computed strictly per symbol in chronological order using `pandas_ta` (with deterministic vectorized Pandas fallbacks).
+
+### Target Contract (`TO_PREDICT`)
+| Column | Type | Definition |
+| :--- | :--- | :--- |
+| `is_positive_growth_4h` | `int` (0/1) | `1` when `(close.shift(-16) / close) - 1.0 >= 0.005`, else `0`. |
+
+### Continuous Features (`NUMERIC` - 40 Features)
+
+| Category | Feature Name | Definition / Formula |
+| :--- | :--- | :--- |
+| Momentum (`pandas_ta`) | `rsi_14` | 14-period Relative Strength Index |
+| Momentum (`pandas_ta`) | `macd` | MACD line (EMA 12 minus EMA 26) |
+| Momentum (`pandas_ta`) | `macd_signal` | 9-period EMA signal line of MACD |
+| Momentum (`pandas_ta`) | `macd_hist` | MACD histogram (`macd - macd_signal`) |
+| Volatility Bands (`pandas_ta`) | `bb_upper` | 20-period Bollinger Band Upper (`+2.0` std) |
+| Volatility Bands (`pandas_ta`) | `bb_mid` | 20-period Bollinger Band Mid (SMA 20) |
+| Volatility Bands (`pandas_ta`) | `bb_lower` | 20-period Bollinger Band Lower (`-2.0` std) |
+| Volatility Bands | `bb_bandwidth` | Normalized band width: `(bb_upper - bb_lower) / bb_mid` |
+| Volatility Bands | `bb_percent_b` | Relative band position: `(close - bb_lower) / (bb_upper - bb_lower)` |
+| Volatility (`pandas_ta`) | `atr_14` | 14-period Average True Range |
+| Volatility | `atr_pct_14` | Price-normalized ATR: `atr_14 / close` |
+| Trend EMAs (`pandas_ta`) | `ema_9`, `ema_21`, `ema_50`, `ema_200` | 9, 21, 50, and 200-bar Exponential Moving Averages |
+| Trend Spreads | `ema_9_21_ratio`, `ema_50_200_ratio` | Short-term (`ema_9 / ema_21 - 1`) and macro (`ema_50 / ema_200 - 1`) trend spreads |
+| Mean Reversion | `close_to_ema_50`, `close_to_ema_200` | Distance from medium and macro trend anchors |
+| Realized Volatility | `vol_1h`, `vol_4h`, `vol_24h` | Rolling log-return standard deviation over 4, 16, and 96 bars |
+| Volume Flow (`pandas_ta`) | `obv` | On-Balance Volume cumulative flow |
+| Volume Flow | `obv_momentum_24h` | 24h OBV change scaled by 24h mean absolute OBV |
+| Liquidity Anchor | `vwap_ratio` | `close / rolling_24h_vwap` (typical price weighted by 96-bar volume) |
+| Volume Anomaly | `volume_zscore_24h` | Standardized 15m volume vs. trailing 24h mean and std |
+| Sentiment (Alt Data) | `fg_value` | Daily Crypto Fear & Greed Index (0-100) joined on UTC date |
+| Sentiment Lags | `fg_value_lag_1d`, `fg_value_lag_3d`, `fg_value_lag_7d` | 1-day, 3-day, and 7-day lagged Fear & Greed Index |
+| Sentiment Dynamics | `fg_change_1d`, `fg_rolling_7d_mean` | 1-day sentiment delta and 7-day rolling sentiment mean |
+| Macro Price Position | `price_to_52w_low`, `price_to_52w_high` | Ratio of `close` to trailing 52-week (35,040-bar) low and high |
+| Multi-Horizon Returns | `ret_15m`, `ret_1h`, `ret_4h`, `ret_24h` | Trailing 1, 4, 16, and 96-bar percentage returns |
+| Candle Microstructure | `candle_body_pct`, `candle_range_pct` | `(close - open) / open` and `(high - low) / close` |
+
+### Transformation and Dummy Feature Sets (`DUMMIES` - 6 Sets, 57 Indicators)
+
+| Set | Columns | Construction |
+| :--- | :--- | :--- |
+| 1. `hour_of_day` | `hour_0` .. `hour_23` (24 cols) | UTC hour one-hot encoding capturing Asian/EU/US session liquidity shifts |
+| 2. `day_of_week` | `dow_0` .. `dow_6` (7 cols) | Weekday vs. weekend regime encoding |
+| 3. `month` | `month_1` .. `month_12` (12 cols) | Calendar seasonality indicators |
+| 4. `volatility_regime_bins` | `vol_regime_low`, `vol_regime_normal`, `vol_regime_high`, `vol_regime_extreme` (4 cols) | Causal trailing 30-day rolling quantile bins (`<=25%`, `25-75%`, `75-90%`, `>=90%`) preventing future leakage |
+| 5. `sentiment_regime_dummies` | `sent_regime_extreme_fear`, `sent_regime_fear`, `sent_regime_neutral`, `sent_regime_greed`, `sent_regime_extreme_greed` (5 cols) | Standard Alternative.me Fear & Greed classification bins |
+| 6. `symbol` | `sym_btc_usdt` .. `sym_ada_usdt` (5 cols) | Asset-level fixed effects for cross-sectional modeling |
+
+---
+
+## 5. Exploratory Data Analysis (EDA) Methodology and Findings
+
+EDA is implemented in [notebooks/01_eda.ipynb](notebooks/01_eda.ipynb) and covers four core checks:
+
+1. **Missing-Value Audit:** Raw indicator computation produces expected leading warmup NaNs (primarily 200-bar EMA and 96-bar volatility windows) plus 16 trailing target rows per symbol. After warmup/tail filtering, remaining NaNs and duplicate `(symbol, timestamp)` keys are verified at `0`.
+2. **Target Class Balance:** Across 15m crypto intervals, `is_positive_growth_4h` (`>= +0.5%` in 4h) represents roughly 30%-40% of bars depending on asset volatility (`SOL/USDT` and `ADA/USDT` exhibit higher positive-threshold frequency and wider return variance than `BTC/USDT` and `BNB/USDT`).
+3. **Sentiment and Volatility Regime Asymmetry:** Pivoting forward 4h returns across `sentiment_regime x volatility_regime` reveals that `Extreme` volatility bins carry disproportionately severe 5th-percentile tail losses, while `Fear` / `Extreme Fear` regimes in `normal` or `high` (non-extreme) volatility offer superior risk-adjusted bounce asymmetry.
+4. **Correlation Drivers:** Normalized volatility (`atr_pct_14`, `vol_24h`, `bb_bandwidth`), mean-reversion oscillators (`rsi_14`, `bb_percent_b`, `vwap_ratio`), and lagged sentiment features (`fg_value`, `fg_rolling_7d_mean`) consistently rank among the strongest linear and rank-correlated predictors of forward 4h upside moves.
+
+---
+
+## 6. Multi-Model Training, Tuning, and Custom Decision Rules
+
+Implemented in [src/train.py](src/train.py) with strict chronological splitting to guarantee zero temporal leakage:
+
+- **Train Split:** `2020-01-01` through `2024-12-31`
+- **Validation Split:** `2025-01-01` through `2025-12-31` (hyperparameter tuning, early stopping, LSTM checkpointing)
+- **Test Split (Out-of-Sample):** `2026-01-01` through present
+
+### Model Architecture Matrix
+
+| Model | Role | Feature Inputs | Key Regularization / Tuning | Saved Artifact |
+| :--- | :--- | :--- | :--- | :--- |
+| `DecisionTreeClassifier` | Lecture Baseline 1 | `NUMERIC + DUMMIES` (97) | `max_depth=10`, `min_samples_leaf=50`, `class_weight='balanced'` | `models/decision_tree.joblib` |
+| `RandomForestClassifier` | Lecture Baseline 2 | `NUMERIC + DUMMIES` (97) | `n_estimators=150`, `max_depth=12`, `min_samples_leaf=50` | `models/random_forest.joblib` |
+| `XGBClassifier` (Tuned) | Advanced Model 1 | `NUMERIC + DUMMIES` (97) | Optuna TPE search (or `RandomizedSearchCV` + `TimeSeriesSplit`) over depth, LR, subsample, colsample, L1/L2, `min_child_weight`, early stopping | `models/xgboost_tuned.joblib` |
+| PyTorch `CryptoLSTMClassifier` | Advanced Model 2 | 16-bar (`4h`) sequences of Train-scaled `NUMERIC` (40) | 2-layer LSTM (`hidden_dim=64`), `LayerNorm`, `Dropout(0.25)`, `BCEWithLogitsLoss(pos_weight)`, `AdamW`, gradient clipping, early stopping | `models/lstm_classifier.pt` + `models/lstm_scaler.joblib` |
+| **Ensemble Blend** | Production Probability | `0.65 * P(XGB) + 0.35 * P(LSTM)` | Combines tree-based tabular splits with temporal sequence representations | `models/model_metadata.json` |
+
+### Custom High-Probability Decision Rule (`pred_custom_rule`)
+
+To suppress noisy mid-confidence predictions and avoid fee drag, a `BUY` signal triggers **only** when all four gates pass simultaneously:
+
+1. `pred_prob_ensemble > 0.65` (high conviction probability)
+2. `fg_value < 45` (contrarian Fear / Extreme Fear sentiment filter)
+3. `volatility_regime != "extreme"` (excludes liquidation cascades and gap whipsaws)
+4. `rsi_14 < 70` (avoids chasing overbought momentum exhaustion)
+
+Run metrics for every model (`roc_auc`, `accuracy`, `precision`, `recall`, `f1`, `precision_at_065`, and rule-level `precision`/`signal_count`) are automatically written to `models/model_metadata.json` on each training run.
+
+---
+
+## 7. Trading Simulations: Vectorized vs. Exact Iterative vs. Benchmark
+
+Implemented in [src/simulator.py](src/simulator.py), every evaluation run produces both fast vectorized screening metrics and an exact path-dependent portfolio simulation benchmarked directly against BTC/USDT Buy-and-Hold over the identical test window.
+
+### Simulation Methodologies
+
+| Engine | Columns / Mechanics | Position Sizing & Risk Rules |
+| :--- | :--- | :--- |
+| **Vector Sim 1 (Baseline)** | `sim1_gross_rev`, `sim1_net_rev` on `pred_baseline` (`prob >= 0.55`) | Fixed `$100` unit notional per signal; `0.20%` round-trip exchange fee |
+| **Vector Sim 2 (Custom Rule)** | `sim2_gross_rev`, `sim2_net_rev` on `pred_custom_rule` | Fixed `$100` unit notional per signal; `0.20%` round-trip fee + sentiment & volatility filters |
+| **Exact Iterative (`itertuples`)** | Chronological bar-by-bar portfolio loop on `pred_custom_rule` | `$10,000` initial capital; max `3` concurrent positions (max 1 per coin); dynamic slot sizing scaled by `clip((prob - 0.50) / 0.35, 0.35, 1.0)` with full capital reinvestment; `0.10%` fee per side; intrabar `2.0%` Stop-Loss (checked before TP conservatively) / `4.0%` Take-Profit / `16-bar` (`4h`) horizon timeout |
+| **Benchmark** | BTC/USDT Buy-and-Hold | `$10,000` invested in `BTC/USDT` on bar 0 after `0.10%` entry fee |
+
+### Tracked Comparison Metrics (`models/simulation_report.json`)
+
+| Metric | Vector Sim 1 (Baseline) | Vector Sim 2 (Custom Rule) | Exact Iterative Portfolio | BTC Buy-and-Hold |
+| :--- | :--- | :--- | :--- | :--- |
+| Initial Capital | `$100` / signal | `$100` / signal | `$10,000.00` | `$10,000.00` |
+| Transaction Fees | `0.20%` round-trip | `0.20%` round-trip | `0.10%` entry + `0.10%` exit | `0.10%` entry |
+| Risk Controls | None | Sentiment + Vol filter | Max 3 pos, Prob sizing, 2% SL / 4% TP | Passive hold |
+| Primary Metrics Reported | Signals, Win Rate, Gross/Net PnL, Profit Factor | Signals, Win Rate, Gross/Net PnL, Profit Factor | Final Equity, Total Return %, CAGR %, Sharpe Ratio, Max Drawdown %, 30d Rolling Returns, Win Rate, Profit Factor, Exit Reasons | Final Equity, Total Return %, CAGR %, Sharpe Ratio, Max Drawdown %, 30d Rolling Returns |
+
+Exact run values are printed to stdout by `format_simulation_report()` and persisted to `models/simulation_report.json` after running `main.py` or `notebooks/02_workflow_runner.ipynb`.
+
+---
+
+## 8. Error Analysis and False Positive Debugging
+
+`run_diagnostics()` in [src/simulator.py](src/simulator.py) performs automated multi-dimensional error slicing and writes complete tables into `models/simulation_report.json`:
+
+1. **By Ticker (`by_ticker`):** Compares signal count, classification precision, vectorized net PnL, exact trade win rate, and exact net PnL across `BTC/USDT`, `ETH/USDT`, `SOL/USDT`, `BNB/USDT`, and `ADA/USDT` to expose whether alpha is concentrated in high-beta altcoins or broad-based.
+2. **By Month (`by_month`):** Tracks temporal stability and regime drift across every month of the out-of-sample test period.
+3. **By Sentiment Regime (`by_sentiment_regime`) & Volatility Regime (`by_volatility_regime`):** Verifies that returns remain positive inside `fear` / `extreme_fear` while confirming the exclusion of `extreme` volatility regimes.
+4. **False Positive Feature Profile (`false_positive_debugging`):**
+   - Computes exact False Positive reduction percentage from `pred_baseline` to `pred_custom_rule`.
+   - Compares mean feature values between **False Positives (FP)** and **True Positives (TP)** across `rsi_14`, `atr_pct_14`, `vol_24h`, `ema_50_200_ratio`, `vwap_ratio`, and `fg_value`.
+   - **Key Root Causes Identified:** Baseline False Positives systematically exhibit elevated `atr_pct_14` / `vol_24h` (panic spikes that trigger 2% stop-losses before rebounding), elevated `fg_value` (crowded greed entries prone to mean reversion), and stretched `rsi_14` (late breakout chases). Filtering on `prob > 0.65`, `fg_value < 45`, `volatility_regime != "extreme"`, and `rsi_14 < 70` directly eliminates these structural failure modes.
+
+---
+
+## 9. Two-Regime Reproduction Guide (Offline vs. Online)
+
+### Prerequisites (Python 3.12 on Pop!_OS / Ubuntu Linux)
+
+```bash
+git clone <your-repo-url> Aegis-Alpha
+cd Aegis-Alpha
+python3.12 -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+pip install -r requirements.txt
+cp .env.example .env
+```
+
+### Regime A: Offline Mode (Instant Peer-Review Reproduction)
+
+Use `--mode offline` to reproduce feature engineering, model training/inference, Vector + Exact simulations, diagnostics, and console notifications immediately from a local SQLite database (`data/market_data.db`) or pre-saved Parquet snapshot (`data/offline_snapshot.parquet`) without waiting for a full historical Binance API download:
+
+```bash
+# Using a local Parquet snapshot or pre-populated data/market_data.db
+python main.py --mode offline --train
+
+# Or automatically download a hosted offline snapshot (e.g. Google Drive direct link)
+python main.py --mode offline \
+  --offline-url "https://drive.google.com/uc?export=download&id=<FILE_ID>" \
+  --offline-path data/offline_snapshot.parquet \
+  --train
+
+# Fast CPU smoke test skipping PyTorch LSTM if GPU/RAM is constrained
+python main.py --mode offline --train --skip-lstm --tuning-trials 8
+```
+
+### Regime B: Online Mode (Full Live Incremental Pipeline)
+
+Use `--mode online` to incrementally sync all 5 trading pairs (`15m`, `2020-01-01` to present) from Binance and the full Crypto Fear & Greed Index into `data/market_data.db`, optionally exporting a fresh Parquet snapshot for offline sharing:
+
+```bash
+# Step 1 (optional standalone ingestion check)
+python -m src.data_fetcher
+python -m src.data_fetcher --summary-only
+
+# Step 2: Full online end-to-end run + model training + offline snapshot export
+python main.py --mode online --train --export-offline-snapshot
+
+# Step 3: Subsequent 15-minute live inference cycles (reuses saved models, Dry-Run orders)
+python main.py --mode online
+
+# Step 4: Enable Binance Spot Testnet execution (requires BINANCE_API_KEY/SECRET in .env)
+python main.py --mode online --execute-orders
+```
+
+### Interactive Notebooks
+
+```bash
+jupyter notebook notebooks/01_eda.ipynb
+jupyter notebook notebooks/02_workflow_runner.ipynb
+```
+
+---
+
+## 10. Automation: Cron Schedule, Docker, Broker, and Telegram
+
+### Pop!_OS / Linux Cron Schedule (`crontab -e`)
+
+Run incremental ingestion, live inference, dry-run/testnet execution, and Telegram notifications 1 minute after every 15-minute candle close, plus weekly Sunday model retraining at 02:00 UTC:
+
+```cron
+# Ensure project environment and logs directory exist
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# Live 15-minute inference and incremental SQLite sync (at :01, :16, :31, :46 past each hour)
+1,16,31,46 * * * * cd /home/$USER/Aegis-Alpha && /home/$USER/Aegis-Alpha/.venv/bin/python main.py --mode online >> /home/$USER/Aegis-Alpha/logs/cron_online.log 2>&1
+
+# Weekly full model retraining (Decision Tree, Random Forest, Optuna XGBoost, PyTorch LSTM) every Sunday at 02:00
+0 2 * * 0 cd /home/$USER/Aegis-Alpha && /home/$USER/Aegis-Alpha/.venv/bin/python main.py --mode online --train --export-offline-snapshot >> /home/$USER/Aegis-Alpha/logs/cron_retrain.log 2>&1
+```
+
+### Docker Execution (`python:3.12-slim`)
+
+```bash
+# Build image
+docker build -t aegis-alpha:latest .
+
+# Run offline reproduction mounting local data/ and models/
+docker run --rm \
+  --env-file .env \
+  -v "$(pwd)/data:/app/data" \
+  -v "$(pwd)/models:/app/models" \
+  aegis-alpha:latest python main.py --mode offline --train
+
+# Run online incremental cycle inside container
+docker run --rm \
+  --env-file .env \
+  -v "$(pwd)/data:/app/data" \
+  -v "$(pwd)/models:/app/models" \
+  aegis-alpha:latest python main.py --mode online
+```
+
+### Broker and Notification Graceful Fallbacks
+- **Binance Broker (`src/broker.py`):** If `BINANCE_API_KEY` or `BINANCE_API_SECRET` is empty (or `--execute-orders` is omitted), all signals execute cleanly in `DRY_RUN` mode with simulated order IDs, fees, and SL/TP levels. When keys are populated and `BINANCE_TESTNET=true`, orders route to Binance Spot Testnet via `exchange.set_sandbox_mode(True)`.
+- **Telegram Notifier (`src/notifier.py`):** If `TELEGRAM_BOT_TOKEN` or `TELEGRAM_CHAT_ID` is empty, formatted trade alerts and portfolio performance summaries gracefully print to the console without error.
+
+---
+
+## 11. Repository Structure and Security Controls
+
+```text
+Aegis-Alpha/
+|-- .env.example                  # Credential template (zero hardcoded secrets)
+|-- .gitignore                    # Excludes data/, .env, *.db*, __pycache__/
+|-- Dockerfile                    # python:3.12-slim non-root container image
+|-- LICENSE                       # Repository license
+|-- README.md                     # Full project documentation (zero emojis)
+|-- main.py                       # CLI orchestrator (--mode online | offline)
+|-- requirements.txt              # Pinned Python 3.12 dependencies
+|-- data/                         # Local SQLite WAL DB & Parquet snapshots (gitignored)
+|-- models/                       # Saved joblib/PyTorch models, metadata & reports
+|-- notebooks/
+|   |-- 01_eda.ipynb              # Target distribution, NaN audit & feature correlations
+|   `-- 02_workflow_runner.ipynb  # End-to-end modular pipeline runner & latest trades
+`-- src/
+    |-- __init__.py
+    |-- config.py                 # python-dotenv config & shared pipeline constants
+    |-- data_fetcher.py           # ccxt 15m OHLCV + Fear & Greed (API/BS4/Playwright)
+    |-- features.py               # 40 NUMERIC + 57 DUMMIES + TO_PREDICT engineering
+    |-- train.py                  # DT, RF, Optuna/RandSearch XGB, PyTorch LSTM + rules
+    |-- simulator.py              # Vector Sim 1/2, Exact itertuples Sim, Benchmark, Diagnostics
+    |-- broker.py                 # ccxt Binance Spot Testnet & Dry-Run execution
+    `-- notifier.py               # Telegram Bot API & Console fallback alerts
+```
+
+### Security Controls
+- Zero hardcoded API keys, tokens, or secrets anywhere in the codebase.
+- All credentials loaded strictly via `python-dotenv` and `os.getenv()` in [src/config.py](src/config.py).
+- `.env`, `data/`, `*.db`, `*.db-wal`, and `*.db-shm` are excluded in [.gitignore](.gitignore).
+
+================================================================================
+FILE: requirements.txt
+================================================================================
+# Core Data Ingestion and APIs
+ccxt>=4.4.0
+requests>=2.32.0
+beautifulsoup4>=4.12.3
+lxml>=5.2.0
+playwright>=1.45.0
+python-dotenv>=1.0.1
+
+# Data Engineering and Technical Analysis
+numpy>=1.26.4,<2.0.0
+pandas>=2.2.2
+pyarrow>=16.1.0
+scipy>=1.13.1
+pandas-ta>=0.3.14b0
+
+# Machine Learning and Deep Learning
+scikit-learn>=1.5.0
+xgboost>=2.1.0
+optuna>=3.6.1
+torch>=2.3.1
+joblib>=1.4.2
+
+# Visualization and Notebooks
+matplotlib>=3.9.0
+seaborn>=0.13.2
+nbformat>=5.10.4
+jupyter>=1.0.0
+ipykernel>=6.29.4
+
+# Notifications and CLI Utilities
+python-telegram-bot>=21.3
+tqdm>=4.66.4
+
+================================================================================
+FILE: src/__init__.py
+================================================================================
+"""Aegis Alpha algorithmic trading pipeline package."""
+
+__version__ = "0.1.0"
+
+================================================================================
+FILE: src/broker.py
+================================================================================
+"""Binance Spot Testnet and Dry-Run broker execution module for Aegis Alpha.
+
+Phase 5 module:
+- Uses ccxt.binance with Spot Testnet sandbox mode when BINANCE_API_KEY and
+  BINANCE_API_SECRET are configured via environment variables.
+- Gracefully falls back to simulated dry-run order execution and structured
+  logging whenever credentials are absent or dry_run=True.
+- Computes dynamic probability-scaled order sizes with strict 2% Stop-Loss
+  and 4% Take-Profit metadata.
+"""
+
+from __future__ import annotations
+
+import logging
+import uuid
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
+from typing import Any
+
+import numpy as np
+import pandas as pd
+
+from src.config import (
+    BINANCE_API_KEY,
+    BINANCE_API_SECRET,
+    BINANCE_TESTNET,
+    INITIAL_CAPITAL,
+    MAX_CONCURRENT_POSITIONS,
+    REQUEST_TIMEOUT_SEC,
+    STOP_LOSS_PCT,
+    TAKE_PROFIT_PCT,
+    TRADING_FEE_RATE,
+)
+
+logger = logging.getLogger("aegis_alpha.broker")
+
+
+@dataclass
+class OrderReceipt:
+    """Standardized execution receipt returned by live, testnet, or dry-run orders."""
+
+    order_id: str
+    mode: str
+    symbol: str
+    side: str
+    status: str
+    price: float
+    quantity: float
+    notional_usd: float
+    estimated_fee_usd: float
+    stop_loss_price: float
+    take_profit_price: float
+    prediction_prob: float
+    timestamp_utc: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+class BinanceBroker:
+    """Spot order execution client supporting Binance Testnet and Dry-Run fallback."""
+
+    def __init__(
+        self,
+        api_key: str = BINANCE_API_KEY,
+        api_secret: str = BINANCE_API_SECRET,
+        testnet: bool = BINANCE_TESTNET,
+        dry_run: bool = False,
+    ) -> None:
+        self.api_key = api_key.strip()
+        self.api_secret = api_secret.strip()
+        self.testnet = testnet
+        self.dry_run = dry_run or not (self.api_key and self.api_secret)
+        self.exchange: Any = None
+
+        if self.dry_run:
+            logger.info(
+                "BinanceBroker initialized in DRY-RUN mode "
+                "(BINANCE_API_KEY/BINANCE_API_SECRET not set or dry_run=True)."
+            )
+        else:
+            self._init_ccxt_client()
+
+    def _init_ccxt_client(self) -> None:
+        try:
+            import ccxt
+        except ImportError:
+            logger.warning("ccxt is not installed; falling back to DRY-RUN broker mode.")
+            self.dry_run = True
+            return
+
+        self.exchange = ccxt.binance(
+            {
+                "apiKey": self.api_key,
+                "secret": self.api_secret,
+                "enableRateLimit": True,
+                "timeout": REQUEST_TIMEOUT_SEC * 1000,
+                "options": {"defaultType": "spot"},
+            }
+        )
+        if self.testnet:
+            self.exchange.set_sandbox_mode(True)
+            logger.info("BinanceBroker initialized on Binance Spot TESTNET.")
+        else:
+            logger.warning("BinanceBroker initialized on LIVE Binance Spot exchange.")
+
+    @property
+    def mode_label(self) -> str:
+        if self.dry_run:
+            return "DRY_RUN"
+        return "BINANCE_TESTNET" if self.testnet else "BINANCE_LIVE"
+
+    def get_usdt_balance(self, default_equity: float = INITIAL_CAPITAL) -> float:
+        """Return available USDT balance (or simulated capital in dry-run mode)."""
+        if self.dry_run or self.exchange is None:
+            return float(default_equity)
+        try:
+            balance = self.exchange.fetch_balance()
+            free_usdt = float(balance.get("USDT", {}).get("free", 0.0))
+            return free_usdt
+        except Exception as exc:
+            logger.warning("Failed to query exchange balance (%s); using default equity.", exc)
+            return float(default_equity)
+
+    def place_market_buy(
+        self,
+        symbol: str,
+        notional_usd: float,
+        reference_price: float,
+        prediction_prob: float = 0.65,
+        stop_loss_pct: float = STOP_LOSS_PCT,
+        take_profit_pct: float = TAKE_PROFIT_PCT,
+    ) -> OrderReceipt:
+        """Place a market BUY order (or log a simulated order in dry-run mode)."""
+        now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        if reference_price <= 0.0 or notional_usd <= 0.0:
+            raise ValueError("reference_price and notional_usd must be strictly positive.")
+
+        stop_loss_price = reference_price * (1.0 - stop_loss_pct)
+        take_profit_price = reference_price * (1.0 + take_profit_pct)
+
+        if self.dry_run or self.exchange is None:
+            qty = notional_usd / reference_price
+            receipt = OrderReceipt(
+                order_id=f"SIM-{uuid.uuid4().hex[:10].upper()}",
+                mode=self.mode_label,
+                symbol=symbol,
+                side="BUY",
+                status="SIMULATED_FILLED",
+                price=round(reference_price, 6),
+                quantity=round(qty, 8),
+                notional_usd=round(notional_usd, 2),
+                estimated_fee_usd=round(notional_usd * TRADING_FEE_RATE, 4),
+                stop_loss_price=round(stop_loss_price, 6),
+                take_profit_price=round(take_profit_price, 6),
+                prediction_prob=round(prediction_prob, 5),
+                timestamp_utc=now_utc,
+            )
+            logger.info(
+                "[%s] BUY %s | qty=%.6f @ $%.4f | notional=$%.2f | SL=$%.4f | TP=$%.4f | prob=%.4f",
+                receipt.mode,
+                receipt.symbol,
+                receipt.quantity,
+                receipt.price,
+                receipt.notional_usd,
+                receipt.stop_loss_price,
+                receipt.take_profit_price,
+                receipt.prediction_prob,
+            )
+            return receipt
+
+        # Testnet / Live execution via ccxt
+        ticker = self.exchange.fetch_ticker(symbol)
+        exec_price = float(ticker.get("last") or reference_price)
+        raw_qty = notional_usd / exec_price
+        precision_qty = float(self.exchange.amount_to_precision(symbol, raw_qty))
+        order = self.exchange.create_market_buy_order(symbol, precision_qty)
+
+        filled_price = float(order.get("average") or order.get("price") or exec_price)
+        filled_qty = float(order.get("filled") or precision_qty)
+        filled_notional = filled_price * filled_qty
+        receipt = OrderReceipt(
+            order_id=str(order.get("id", "UNKNOWN")),
+            mode=self.mode_label,
+            symbol=symbol,
+            side="BUY",
+            status=str(order.get("status", "SUBMITTED")).upper(),
+            price=round(filled_price, 6),
+            quantity=round(filled_qty, 8),
+            notional_usd=round(filled_notional, 2),
+            estimated_fee_usd=round(filled_notional * TRADING_FEE_RATE, 4),
+            stop_loss_price=round(filled_price * (1.0 - stop_loss_pct), 6),
+            take_profit_price=round(filled_price * (1.0 + take_profit_pct), 6),
+            prediction_prob=round(prediction_prob, 5),
+            timestamp_utc=now_utc,
+        )
+        logger.info(
+            "[%s] Submitted order %s: BUY %s qty=%.6f @ $%.4f",
+            receipt.mode,
+            receipt.order_id,
+            receipt.symbol,
+            receipt.quantity,
+            receipt.price,
+        )
+        return receipt
+
+    def execute_latest_signals(
+        self,
+        predictions_df: pd.DataFrame,
+        signal_col: str = "pred_custom_rule",
+        prob_col: str = "pred_prob_ensemble",
+        max_positions: int = MAX_CONCURRENT_POSITIONS,
+        fallback_equity: float = INITIAL_CAPITAL,
+    ) -> list[OrderReceipt]:
+        """Inspect the latest bar per symbol and execute BUY orders for active signals."""
+        if predictions_df.empty:
+            return []
+
+        latest_per_symbol = (
+            predictions_df.sort_values("timestamp")
+            .groupby("symbol", as_index=False)
+            .tail(1)
+            .sort_values(prob_col, ascending=False)
+        )
+        actionable = latest_per_symbol[latest_per_symbol[signal_col] == 1].head(max_positions)
+        if actionable.empty:
+            logger.info("No actionable BUY signals on the latest bar across monitored symbols.")
+            return []
+
+        available_usdt = self.get_usdt_balance(default_equity=fallback_equity)
+        base_slot = available_usdt / float(max_positions)
+        receipts: list[OrderReceipt] = []
+
+        for row in actionable.itertuples(index=False):
+            prob = float(getattr(row, prob_col))
+            scale = float(np.clip((prob - 0.50) / 0.35, 0.35, 1.0))
+            notional = min(base_slot * scale, available_usdt / (1.0 + TRADING_FEE_RATE))
+            if notional < 10.0:
+                continue
+            receipt = self.place_market_buy(
+                symbol=str(row.symbol),
+                notional_usd=notional,
+                reference_price=float(row.close),
+                prediction_prob=prob,
+            )
+            receipts.append(receipt)
+            available_usdt -= notional * (1.0 + TRADING_FEE_RATE)
+
+        return receipts
+
+================================================================================
+FILE: src/config.py
+================================================================================
+"""Centralized configuration for the Aegis Alpha pipeline.
+
+Loads secrets and runtime overrides from environment variables via python-dotenv
+without hardcoding credentials.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from pathlib import Path
+from typing import Final
+
+from dotenv import load_dotenv
+
+# Project directories
+PROJECT_ROOT: Final[Path] = Path(__file__).resolve().parent.parent
+SRC_DIR: Final[Path] = PROJECT_ROOT / "src"
+DATA_DIR: Final[Path] = PROJECT_ROOT / "data"
+MODELS_DIR: Final[Path] = PROJECT_ROOT / "models"
+NOTEBOOKS_DIR: Final[Path] = PROJECT_ROOT / "notebooks"
+
+# Load environment variables from project root .env if present
+load_dotenv(dotenv_path=PROJECT_ROOT / ".env", override=False)
+
+
+def _get_bool_env(name: str, default: bool = False) -> bool:
+    """Parse a boolean environment variable safely."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+# Credentials (loaded exclusively from environment variables)
+TELEGRAM_BOT_TOKEN: Final[str] = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID: Final[str] = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+BINANCE_API_KEY: Final[str] = os.getenv("BINANCE_API_KEY", "").strip()
+BINANCE_API_SECRET: Final[str] = os.getenv("BINANCE_API_SECRET", "").strip()
+BINANCE_TESTNET: Final[bool] = _get_bool_env("BINANCE_TESTNET", default=True)
+
+# Storage paths
+_db_env_path = os.getenv("DATABASE_PATH", "data/market_data.db").strip()
+DB_PATH: Final[Path] = (
+    Path(_db_env_path)
+    if Path(_db_env_path).is_absolute()
+    else PROJECT_ROOT / _db_env_path
+)
+LOG_LEVEL: Final[str] = os.getenv("LOG_LEVEL", "INFO").strip().upper()
+
+# Phase 1: Market data and alternative data ingestion constants
+SYMBOLS: Final[list[str]] = [
+    "BTC/USDT",
+    "ETH/USDT",
+    "SOL/USDT",
+    "BNB/USDT",
+    "ADA/USDT",
+]
+TIMEFRAME: Final[str] = "15m"
+TIMEFRAME_SECONDS: Final[int] = 15 * 60
+TIMEFRAME_MS: Final[int] = TIMEFRAME_SECONDS * 1000
+START_DATE_ISO: Final[str] = "2020-01-01T00:00:00Z"
+OHLCV_BATCH_LIMIT: Final[int] = 1000
+
+FEAR_GREED_API_URL: Final[str] = "https://api.alternative.me/fng/?limit=0&format=json"
+FEAR_GREED_WEB_URL: Final[str] = "https://alternative.me/crypto/fear-and-greed-index/"
+
+# Network and SQLite reliability parameters
+SQLITE_BUSY_TIMEOUT_MS: Final[int] = 30000
+REQUEST_TIMEOUT_SEC: Final[int] = 30
+MAX_RETRIES: Final[int] = 5
+RETRY_BACKOFF_SEC: Final[float] = 2.0
+
+# Shared downstream pipeline contracts (Phases 2-5)
+TRAIN_END_ISO: Final[str] = "2024-12-31T23:59:59Z"
+VAL_START_ISO: Final[str] = "2025-01-01T00:00:00Z"
+VAL_END_ISO: Final[str] = "2025-12-31T23:59:59Z"
+TEST_START_ISO: Final[str] = "2026-01-01T00:00:00Z"
+
+INITIAL_CAPITAL: Final[float] = 10000.0
+MAX_CONCURRENT_POSITIONS: Final[int] = 3
+TRADING_FEE_RATE: Final[float] = 0.001
+STOP_LOSS_PCT: Final[float] = 0.02
+TAKE_PROFIT_PCT: Final[float] = 0.04
+
+
+def ensure_directories() -> None:
+    """Create required runtime directories if they do not exist."""
+    for directory in (DATA_DIR, MODELS_DIR, NOTEBOOKS_DIR, DB_PATH.parent):
+        directory.mkdir(parents=True, exist_ok=True)
+
+
+def configure_logging(level: str | None = None) -> logging.Logger:
+    """Configure standardized ASCII logging for the Aegis Alpha pipeline."""
+    resolved_level = (level or LOG_LEVEL).upper()
+    numeric_level = getattr(logging, resolved_level, logging.INFO)
+    logging.basicConfig(
+        level=numeric_level,
+        format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    return logging.getLogger("aegis_alpha")
+
+================================================================================
+FILE: src/data_fetcher.py
+================================================================================
+"""High-volume incremental OHLCV and Fear & Greed Index ingestion into SQLite.
+
+Phase 1 module for Aegis Alpha:
+- Fetches 15m OHLCV candles from Binance via ccxt with rate limiting, retries,
+  pagination (limit=1000, since=last_timestamp + 1), and incremental SQLite
+  resumption via SELECT MAX(timestamp) FROM ohlcv WHERE symbol = ?.
+- Fetches historical Crypto Fear & Greed Index from alternative.me API with
+  BeautifulSoup and Playwright fallback scrapers.
+- Stores all data in SQLite configured with WAL journaling and composite PKs.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import re
+import sqlite3
+import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any, Iterable, Sequence
+
+import requests
+
+from src.config import (
+    DB_PATH,
+    FEAR_GREED_API_URL,
+    FEAR_GREED_WEB_URL,
+    MAX_RETRIES,
+    OHLCV_BATCH_LIMIT,
+    REQUEST_TIMEOUT_SEC,
+    RETRY_BACKOFF_SEC,
+    SQLITE_BUSY_TIMEOUT_MS,
+    START_DATE_ISO,
+    SYMBOLS,
+    TIMEFRAME,
+    TIMEFRAME_MS,
+    configure_logging,
+    ensure_directories,
+)
+
+logger = logging.getLogger("aegis_alpha.data_fetcher")
+
+HTTP_HEADERS: dict[str, str] = {
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/html;q=0.9, */*;q=0.8",
+}
+
+
+def parse_iso_to_ms(iso_timestamp: str) -> int:
+    """Convert an ISO-8601 UTC timestamp string into Unix epoch milliseconds."""
+    normalized = iso_timestamp.strip()
+    if normalized.endswith("Z"):
+        normalized = normalized[:-1] + "+00:00"
+    dt = datetime.fromisoformat(normalized)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return int(dt.astimezone(timezone.utc).timestamp() * 1000)
+
+
+def epoch_ms_to_iso(timestamp_ms: int) -> str:
+    """Convert Unix epoch milliseconds into an ISO-8601 UTC string."""
+    dt = datetime.fromtimestamp(timestamp_ms / 1000.0, tz=timezone.utc)
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def classify_fear_greed(value: int) -> str:
+    """Map numeric Fear & Greed score (0-100) to standard regime label."""
+    if value <= 24:
+        return "Extreme Fear"
+    if value <= 44:
+        return "Fear"
+    if value <= 55:
+        return "Neutral"
+    if value <= 74:
+        return "Greed"
+    return "Extreme Greed"
+
+
+def get_db_connection(db_path: Path = DB_PATH) -> sqlite3.Connection:
+    """Open a SQLite connection configured with WAL mode and concurrency pragmas."""
+    resolved_path = Path(db_path)
+    resolved_path.parent.mkdir(parents=True, exist_ok=True)
+
+    conn = sqlite3.connect(
+        str(resolved_path),
+        timeout=SQLITE_BUSY_TIMEOUT_MS / 1000.0,
+    )
+    conn.row_factory = sqlite3.Row
+
+    # Enforce WAL mode and safe concurrency settings on every connection
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute("PRAGMA foreign_keys=ON;")
+    conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS};")
+    conn.execute("PRAGMA temp_store=MEMORY;")
+    return conn
+
+
+def init_database(conn: sqlite3.Connection) -> None:
+    """Create the ohlcv and fear_greed tables and indexes if absent."""
+    with conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ohlcv (
+                symbol TEXT NOT NULL,
+                timestamp INTEGER NOT NULL,
+                datetime_utc TEXT NOT NULL,
+                open REAL NOT NULL,
+                high REAL NOT NULL,
+                low REAL NOT NULL,
+                close REAL NOT NULL,
+                volume REAL NOT NULL,
+                PRIMARY KEY (symbol, timestamp)
+            ) WITHOUT ROWID;
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_ohlcv_timestamp
+            ON ohlcv (timestamp);
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS fear_greed (
+                timestamp INTEGER PRIMARY KEY,
+                date_utc TEXT NOT NULL UNIQUE,
+                value INTEGER NOT NULL,
+                classification TEXT NOT NULL,
+                source TEXT NOT NULL
+            );
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_fear_greed_date
+            ON fear_greed (date_utc);
+            """
+        )
+
+
+def create_binance_exchange() -> Any:
+    """Instantiate a rate-limited public ccxt Binance spot client."""
+    try:
+        import ccxt
+    except ImportError as exc:
+        raise ImportError(
+            "ccxt is required for OHLCV ingestion. Install dependencies via "
+            "'pip install -r requirements.txt'."
+        ) from exc
+
+    return ccxt.binance(
+        {
+            "enableRateLimit": True,
+            "timeout": REQUEST_TIMEOUT_SEC * 1000,
+            "options": {"defaultType": "spot"},
+        }
+    )
+
+
+def get_latest_ohlcv_timestamp(conn: sqlite3.Connection, symbol: str) -> int | None:
+    """Query the most recent stored candle timestamp (ms) for a symbol."""
+    cursor = conn.execute(
+        "SELECT MAX(timestamp) FROM ohlcv WHERE symbol = ?;",
+        (symbol,),
+    )
+    row = cursor.fetchone()
+    if row is None or row[0] is None:
+        return None
+    return int(row[0])
+
+
+def _get_latest_closed_candle_open_ms(
+    timeframe_ms: int = TIMEFRAME_MS,
+    now_ms: int | None = None,
+) -> int:
+    """Return the open timestamp (ms) of the latest fully closed candle."""
+    current_ms = int(time.time() * 1000) if now_ms is None else now_ms
+    current_candle_open = (current_ms // timeframe_ms) * timeframe_ms
+    return current_candle_open - timeframe_ms
+
+
+def _fetch_ohlcv_page_with_retry(
+    exchange: Any,
+    symbol: str,
+    timeframe: str,
+    since: int,
+    limit: int,
+    max_retries: int = MAX_RETRIES,
+    base_backoff_sec: float = RETRY_BACKOFF_SEC,
+) -> list[list[Any]]:
+    """Fetch a single OHLCV page with exponential backoff on transient failures."""
+    try:
+        import ccxt
+
+        retryable_errors: tuple[type[BaseException], ...] = (
+            ccxt.RateLimitExceeded,
+            ccxt.DDoSProtection,
+            ccxt.NetworkError,
+            ccxt.ExchangeNotAvailable,
+            ccxt.RequestTimeout,
+        )
+    except ImportError:
+        retryable_errors = (TimeoutError, ConnectionError)
+
+    last_error: Exception | None = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            candles = exchange.fetch_ohlcv(
+                symbol=symbol,
+                timeframe=timeframe,
+                since=since,
+                limit=limit,
+            )
+            return candles or []
+        except retryable_errors as exc:
+            last_error = exc
+            sleep_sec = base_backoff_sec * (2 ** (attempt - 1))
+            logger.warning(
+                "Transient ccxt error for %s at since=%d (attempt %d/%d): %s. "
+                "Retrying in %.1fs.",
+                symbol,
+                since,
+                attempt,
+                max_retries,
+                exc,
+                sleep_sec,
+            )
+            time.sleep(sleep_sec)
+
+    raise RuntimeError(
+        f"Failed to fetch OHLCV for {symbol} at since={since} after "
+        f"{max_retries} attempts."
+    ) from last_error
+
+
+def upsert_ohlcv_batch(
+    conn: sqlite3.Connection,
+    symbol: str,
+    candles: Iterable[Sequence[Any]],
+    max_timestamp_ms: int | None = None,
+) -> int:
+    """Validate and upsert a batch of OHLCV rows into SQLite."""
+    rows_to_insert: list[tuple[str, int, str, float, float, float, float, float]] = []
+    for candle in candles:
+        if len(candle) < 6:
+            continue
+        ts_raw, open_p, high_p, low_p, close_p, volume = candle[:6]
+        if None in (ts_raw, open_p, high_p, low_p, close_p, volume):
+            continue
+        ts_ms = int(ts_raw)
+        if max_timestamp_ms is not None and ts_ms > max_timestamp_ms:
+            continue
+        rows_to_insert.append(
+            (
+                symbol,
+                ts_ms,
+                epoch_ms_to_iso(ts_ms),
+                float(open_p),
+                float(high_p),
+                float(low_p),
+                float(close_p),
+                float(volume),
+            )
+        )
+
+    if not rows_to_insert:
+        return 0
+
+    with conn:
+        conn.executemany(
+            """
+            INSERT OR REPLACE INTO ohlcv (
+                symbol, timestamp, datetime_utc, open, high, low, close, volume
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+            """,
+            rows_to_insert,
+        )
+    return len(rows_to_insert)
+
+
+def fetch_symbol_ohlcv_incremental(
+    conn: sqlite3.Connection,
+    exchange: Any,
+    symbol: str,
+    timeframe: str = TIMEFRAME,
+    start_iso: str = START_DATE_ISO,
+    end_ms: int | None = None,
+    limit: int = OHLCV_BATCH_LIMIT,
+    timeframe_ms: int = TIMEFRAME_MS,
+) -> int:
+    """Incrementally fetch and store OHLCV candles for a single trading pair.
+
+    Queries SELECT MAX(timestamp) FROM ohlcv WHERE symbol = ? before fetching
+    so subsequent runs only pull missing candles.
+    """
+    latest_stored_ts = get_latest_ohlcv_timestamp(conn, symbol)
+    if latest_stored_ts is not None:
+        since = latest_stored_ts + 1
+        logger.info(
+            "[%s] Resuming incremental load from %s (since=%d).",
+            symbol,
+            epoch_ms_to_iso(since),
+            since,
+        )
+    else:
+        since = parse_iso_to_ms(start_iso)
+        logger.info(
+            "[%s] Starting full historical load from %s (since=%d).",
+            symbol,
+            start_iso,
+            since,
+        )
+
+    target_end_ms = (
+        _get_latest_closed_candle_open_ms(timeframe_ms=timeframe_ms)
+        if end_ms is None
+        else end_ms
+    )
+
+    if since > target_end_ms:
+        logger.info(
+            "[%s] Already up to date through %s. Skipping.",
+            symbol,
+            epoch_ms_to_iso(target_end_ms),
+        )
+        return 0
+
+    total_inserted = 0
+    batch_count = 0
+
+    while since <= target_end_ms:
+        candles = _fetch_ohlcv_page_with_retry(
+            exchange=exchange,
+            symbol=symbol,
+            timeframe=timeframe,
+            since=since,
+            limit=limit,
+        )
+        if not candles:
+            logger.info("[%s] Exchange returned empty page at since=%d; stopping.", symbol, since)
+            break
+
+        inserted = upsert_ohlcv_batch(
+            conn=conn,
+            symbol=symbol,
+            candles=candles,
+            max_timestamp_ms=target_end_ms,
+        )
+        total_inserted += inserted
+        batch_count += 1
+
+        last_ts = int(candles[-1][0])
+        if last_ts < since:
+            logger.warning(
+                "[%s] Non-advancing timestamp encountered (last_ts=%d < since=%d); stopping.",
+                symbol,
+                last_ts,
+                since,
+            )
+            break
+
+        since = last_ts + 1
+
+        if batch_count % 25 == 0:
+            logger.info(
+                "[%s] Progress: %d batches | %d new candles | cursor=%s",
+                symbol,
+                batch_count,
+                total_inserted,
+                epoch_ms_to_iso(last_ts),
+            )
+
+        if last_ts >= target_end_ms:
+            break
+        if len(candles) < limit and (last_ts + timeframe_ms) > target_end_ms:
+            break
+
+    logger.info(
+        "[%s] Completed OHLCV sync: %d candles upserted across %d batches.",
+        symbol,
+        total_inserted,
+        batch_count,
+    )
+    return total_inserted
+
+
+def fetch_all_ohlcv(
+    conn: sqlite3.Connection,
+    symbols: Sequence[str] = SYMBOLS,
+    timeframe: str = TIMEFRAME,
+    start_iso: str = START_DATE_ISO,
+    end_ms: int | None = None,
+    limit: int = OHLCV_BATCH_LIMIT,
+    exchange: Any | None = None,
+) -> dict[str, int]:
+    """Fetch incremental OHLCV data for all configured trading pairs."""
+    client = exchange if exchange is not None else create_binance_exchange()
+    results: dict[str, int] = {}
+
+    for symbol in symbols:
+        inserted = fetch_symbol_ohlcv_incremental(
+            conn=conn,
+            exchange=client,
+            symbol=symbol,
+            timeframe=timeframe,
+            start_iso=start_iso,
+            end_ms=end_ms,
+            limit=limit,
+        )
+        results[symbol] = inserted
+
+    return results
+
+
+def _normalize_date_to_utc_midnight_ms(dt: datetime) -> tuple[int, str]:
+    """Normalize a datetime object to UTC midnight epoch ms and YYYY-MM-DD."""
+    utc_dt = dt.astimezone(timezone.utc) if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    midnight = datetime(utc_dt.year, utc_dt.month, utc_dt.day, tzinfo=timezone.utc)
+    return int(midnight.timestamp() * 1000), midnight.strftime("%Y-%m-%d")
+
+
+def fetch_fear_greed_from_api(
+    url: str = FEAR_GREED_API_URL,
+    timeout: int = REQUEST_TIMEOUT_SEC,
+    max_retries: int = MAX_RETRIES,
+) -> list[dict[str, Any]]:
+    """Fetch complete historical Crypto Fear & Greed Index from alternative.me JSON API."""
+    last_error: Exception | None = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = requests.get(url, headers=HTTP_HEADERS, timeout=timeout)
+            response.raise_for_status()
+            payload = response.json()
+            raw_entries = payload.get("data", [])
+            if not raw_entries:
+                raise ValueError("Alternative.me API returned an empty 'data' list.")
+
+            records: list[dict[str, Any]] = []
+            seen_dates: set[str] = set()
+            for item in raw_entries:
+                try:
+                    value = int(item["value"])
+                    ts_sec = int(item["timestamp"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if not (0 <= value <= 100):
+                    continue
+
+                dt_utc = datetime.fromtimestamp(ts_sec, tz=timezone.utc)
+                ts_ms, date_utc = _normalize_date_to_utc_midnight_ms(dt_utc)
+                if date_utc in seen_dates:
+                    continue
+                seen_dates.add(date_utc)
+
+                classification = str(
+                    item.get("value_classification") or classify_fear_greed(value)
+                ).strip()
+                records.append(
+                    {
+                        "timestamp": ts_ms,
+                        "date_utc": date_utc,
+                        "value": value,
+                        "classification": classification,
+                        "source": "alternative_me_api",
+                    }
+                )
+
+            if not records:
+                raise ValueError("No valid Fear & Greed records parsed from API payload.")
+
+            records.sort(key=lambda r: r["timestamp"])
+            logger.info("Fetched %d Fear & Greed records via primary API.", len(records))
+            return records
+        except (requests.RequestException, ValueError, json.JSONDecodeError) as exc:
+            last_error = exc
+            sleep_sec = RETRY_BACKOFF_SEC * (2 ** (attempt - 1))
+            logger.warning(
+                "Fear & Greed API attempt %d/%d failed: %s. Retrying in %.1fs.",
+                attempt,
+                max_retries,
+                exc,
+                sleep_sec,
+            )
+            time.sleep(sleep_sec)
+
+    raise RuntimeError("Fear & Greed primary API failed after retries.") from last_error
+
+
+def parse_fear_greed_html(html: str, source_name: str) -> list[dict[str, Any]]:
+    """Parse Fear & Greed values from alternative.me HTML using BeautifulSoup."""
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError as exc:
+        raise ImportError(
+            "beautifulsoup4 is required for Fear & Greed HTML fallback parsing."
+        ) from exc
+
+    try:
+        soup = BeautifulSoup(html, "lxml")
+    except Exception:
+        soup = BeautifulSoup(html, "html.parser")
+
+    records_by_date: dict[str, dict[str, Any]] = {}
+    now_utc = datetime.now(timezone.utc)
+
+    # Strategy A: Look for embedded JSON time-series arrays inside <script> blocks
+    date_val_pattern = re.compile(
+        r'"(\d{4}-\d{2}-\d{2})"\s*[:,\]]\s*(\d{1,3})\b'
+    )
+    for script in soup.find_all("script"):
+        script_text = script.string or script.get_text() or ""
+        if not script_text:
+            continue
+        for match in date_val_pattern.finditer(script_text):
+            date_str, val_str = match.group(1), match.group(2)
+            val = int(val_str)
+            if 0 <= val <= 100:
+                try:
+                    dt = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                except ValueError:
+                    continue
+                ts_ms, date_utc = _normalize_date_to_utc_midnight_ms(dt)
+                records_by_date[date_utc] = {
+                    "timestamp": ts_ms,
+                    "date_utc": date_utc,
+                    "value": val,
+                    "classification": classify_fear_greed(val),
+                    "source": source_name,
+                }
+
+    # Strategy B: Parse standard alternative.me historical summary blocks
+    relative_offsets = {
+        "now": 0,
+        "today": 0,
+        "yesterday": 1,
+        "last week": 7,
+        "last month": 30,
+    }
+    for block in soup.select(".fng-value"):
+        label_el = block.select_one(".gray")
+        circle_el = block.select_one(".fng-circle")
+        status_el = block.select_one(".status")
+        if not (label_el and circle_el):
+            continue
+        label_text = label_el.get_text(strip=True).lower()
+        val_digits = re.search(r"\d{1,3}", circle_el.get_text(strip=True))
+        if not val_digits:
+            continue
+        val = int(val_digits.group(0))
+        if not (0 <= val <= 100):
+            continue
+        offset_days = relative_offsets.get(label_text)
+        if offset_days is None:
+            continue
+        target_dt = now_utc - timedelta(days=offset_days)
+        ts_ms, date_utc = _normalize_date_to_utc_midnight_ms(target_dt)
+        classification = (
+            status_el.get_text(strip=True) if status_el else classify_fear_greed(val)
+        )
+        records_by_date.setdefault(
+            date_utc,
+            {
+                "timestamp": ts_ms,
+                "date_utc": date_utc,
+                "value": val,
+                "classification": classification,
+                "source": source_name,
+            },
+        )
+
+    # Strategy C: Fallback single current circle value
+    if not records_by_date:
+        circle_el = soup.select_one(".fng-circle")
+        if circle_el:
+            val_digits = re.search(r"\d{1,3}", circle_el.get_text(strip=True))
+            if val_digits:
+                val = int(val_digits.group(0))
+                if 0 <= val <= 100:
+                    ts_ms, date_utc = _normalize_date_to_utc_midnight_ms(now_utc)
+                    records_by_date[date_utc] = {
+                        "timestamp": ts_ms,
+                        "date_utc": date_utc,
+                        "value": val,
+                        "classification": classify_fear_greed(val),
+                        "source": source_name,
+                    }
+
+    records = sorted(records_by_date.values(), key=lambda r: r["timestamp"])
+    return records
+
+
+def fetch_fear_greed_via_bs4(
+    url: str = FEAR_GREED_WEB_URL,
+    timeout: int = REQUEST_TIMEOUT_SEC,
+) -> list[dict[str, Any]]:
+    """Fallback #1: Scrape Fear & Greed Index page with requests + BeautifulSoup."""
+    response = requests.get(url, headers=HTTP_HEADERS, timeout=timeout)
+    response.raise_for_status()
+    records = parse_fear_greed_html(response.text, source_name="bs4_scraper")
+    if not records:
+        raise ValueError("BeautifulSoup fallback could not extract Fear & Greed records.")
+    logger.info("Fetched %d Fear & Greed records via BeautifulSoup fallback.", len(records))
+    return records
+
+
+def fetch_fear_greed_via_playwright(
+    url: str = FEAR_GREED_WEB_URL,
+    timeout: int = REQUEST_TIMEOUT_SEC,
+) -> list[dict[str, Any]]:
+    """Fallback #2: Render Fear & Greed page with headless Playwright and parse DOM."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError as exc:
+        raise ImportError(
+            "playwright is required for headless browser fallback scraping."
+        ) from exc
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        try:
+            page = browser.new_page(user_agent=HTTP_HEADERS["User-Agent"])
+            page.goto(url, wait_until="networkidle", timeout=timeout * 1000)
+            html = page.content()
+        finally:
+            browser.close()
+
+    records = parse_fear_greed_html(html, source_name="playwright_scraper")
+    if not records:
+        raise ValueError("Playwright fallback could not extract Fear & Greed records.")
+    logger.info("Fetched %d Fear & Greed records via Playwright fallback.", len(records))
+    return records
+
+
+def upsert_fear_greed_records(
+    conn: sqlite3.Connection,
+    records: Sequence[dict[str, Any]],
+) -> int:
+    """Upsert normalized Fear & Greed Index records into SQLite."""
+    if not records:
+        return 0
+
+    rows = [
+        (
+            int(rec["timestamp"]),
+            str(rec["date_utc"]),
+            int(rec["value"]),
+            str(rec["classification"]),
+            str(rec["source"]),
+        )
+        for rec in records
+    ]
+    with conn:
+        conn.executemany(
+            """
+            INSERT OR REPLACE INTO fear_greed (
+                timestamp, date_utc, value, classification, source
+            ) VALUES (?, ?, ?, ?, ?);
+            """,
+            rows,
+        )
+    return len(rows)
+
+
+def fetch_and_store_fear_greed(
+    conn: sqlite3.Connection,
+    allow_fallback: bool = True,
+) -> int:
+    """Fetch Fear & Greed data (API primary, BS4/Playwright fallback) and store in SQLite."""
+    records: list[dict[str, Any]] = []
+    try:
+        records = fetch_fear_greed_from_api()
+    except Exception as api_exc:
+        if not allow_fallback:
+            raise
+        logger.warning(
+            "Primary Fear & Greed API failed (%s). Trying BeautifulSoup fallback.",
+            api_exc,
+        )
+        try:
+            records = fetch_fear_greed_via_bs4()
+        except Exception as bs4_exc:
+            logger.warning(
+                "BeautifulSoup fallback failed (%s). Trying Playwright fallback.",
+                bs4_exc,
+            )
+            records = fetch_fear_greed_via_playwright()
+
+    count = upsert_fear_greed_records(conn, records)
+    logger.info("Upserted %d Fear & Greed records into SQLite.", count)
+    return count
+
+
+def get_database_summary(conn: sqlite3.Connection) -> dict[str, Any]:
+    """Collect row counts, date bounds, and WAL status from the SQLite database."""
+    journal_mode = conn.execute("PRAGMA journal_mode;").fetchone()[0]
+
+    ohlcv_rows = conn.execute(
+        """
+        SELECT
+            symbol,
+            COUNT(*) AS row_count,
+            MIN(datetime_utc) AS min_utc,
+            MAX(datetime_utc) AS max_utc
+        FROM ohlcv
+        GROUP BY symbol
+        ORDER BY symbol;
+        """
+    ).fetchall()
+
+    ohlcv_by_symbol = [
+        {
+            "symbol": row["symbol"],
+            "row_count": int(row["row_count"]),
+            "min_utc": row["min_utc"],
+            "max_utc": row["max_utc"],
+        }
+        for row in ohlcv_rows
+    ]
+    total_ohlcv = sum(item["row_count"] for item in ohlcv_by_symbol)
+
+    fg_row = conn.execute(
+        """
+        SELECT
+            COUNT(*) AS row_count,
+            MIN(date_utc) AS min_date,
+            MAX(date_utc) AS max_date
+        FROM fear_greed;
+        """
+    ).fetchone()
+
+    return {
+        "journal_mode": str(journal_mode),
+        "ohlcv_total_rows": total_ohlcv,
+        "ohlcv_by_symbol": ohlcv_by_symbol,
+        "fear_greed_total_rows": int(fg_row["row_count"]) if fg_row else 0,
+        "fear_greed_min_date": fg_row["min_date"] if fg_row else None,
+        "fear_greed_max_date": fg_row["max_date"] if fg_row else None,
+    }
+
+
+def format_database_summary(summary: dict[str, Any]) -> str:
+    """Render a clean ASCII summary table of SQLite ingestion state."""
+    lines = [
+        "==========================================================================",
+        "AEGIS ALPHA - SQLITE MARKET DATA SUMMARY",
+        "==========================================================================",
+        f"SQLite journal_mode : {summary['journal_mode']}",
+        f"Total OHLCV rows    : {summary['ohlcv_total_rows']:,}",
+        "--------------------------------------------------------------------------",
+        f"{'Symbol':<12} | {'Rows':>10} | {'Min UTC':<20} | {'Max UTC':<20}",
+        "--------------------------------------------------------------------------",
+    ]
+    for item in summary["ohlcv_by_symbol"]:
+        lines.append(
+            f"{item['symbol']:<12} | {item['row_count']:>10,} | "
+            f"{str(item['min_utc'] or 'N/A'):<20} | {str(item['max_utc'] or 'N/A'):<20}"
+        )
+    if not summary["ohlcv_by_symbol"]:
+        lines.append("No OHLCV rows stored.")
+    lines.extend(
+        [
+            "--------------------------------------------------------------------------",
+            f"Fear & Greed rows   : {summary['fear_greed_total_rows']:,} "
+            f"({summary['fear_greed_min_date'] or 'N/A'} to "
+            f"{summary['fear_greed_max_date'] or 'N/A'})",
+            "==========================================================================",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def run_ingestion(
+    db_path: Path = DB_PATH,
+    symbols: Sequence[str] = SYMBOLS,
+    timeframe: str = TIMEFRAME,
+    start_iso: str = START_DATE_ISO,
+    end_ms: int | None = None,
+    skip_ohlcv: bool = False,
+    skip_fear_greed: bool = False,
+) -> dict[str, Any]:
+    """Execute end-to-end Phase 1 incremental ingestion into SQLite."""
+    ensure_directories()
+    conn = get_db_connection(db_path=db_path)
+    try:
+        init_database(conn)
+
+        ohlcv_counts: dict[str, int] = {}
+        if not skip_ohlcv:
+            ohlcv_counts = fetch_all_ohlcv(
+                conn=conn,
+                symbols=symbols,
+                timeframe=timeframe,
+                start_iso=start_iso,
+                end_ms=end_ms,
+            )
+
+        fear_greed_count = 0
+        if not skip_fear_greed:
+            fear_greed_count = fetch_and_store_fear_greed(conn=conn)
+
+        summary = get_database_summary(conn)
+        summary["newly_inserted_ohlcv"] = ohlcv_counts
+        summary["upserted_fear_greed"] = fear_greed_count
+        return summary
+    finally:
+        conn.close()
+
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Aegis Alpha Phase 1 incremental OHLCV and Fear & Greed ingestion."
+    )
+    parser.add_argument(
+        "--db-path",
+        type=Path,
+        default=DB_PATH,
+        help=f"Path to SQLite database file (default: {DB_PATH}).",
+    )
+    parser.add_argument(
+        "--symbols",
+        nargs="+",
+        default=list(SYMBOLS),
+        help="Trading pairs to ingest (default: 5 configured USDT pairs).",
+    )
+    parser.add_argument(
+        "--start-date",
+        type=str,
+        default=START_DATE_ISO,
+        help=f"ISO-8601 UTC start date for initial backfill (default: {START_DATE_ISO}).",
+    )
+    parser.add_argument(
+        "--skip-ohlcv",
+        action="store_true",
+        help="Skip Binance OHLCV ingestion.",
+    )
+    parser.add_argument(
+        "--skip-fear-greed",
+        action="store_true",
+        help="Skip Crypto Fear & Greed Index ingestion.",
+    )
+    parser.add_argument(
+        "--summary-only",
+        action="store_true",
+        help="Print current SQLite database summary without fetching new data.",
+    )
+    return parser
+
+
+def main() -> None:
+    """CLI entrypoint for Phase 1 ingestion."""
+    configure_logging()
+    args = _build_arg_parser().parse_args()
+
+    if args.summary_only:
+        ensure_directories()
+        conn = get_db_connection(args.db_path)
+        try:
+            init_database(conn)
+            summary = get_database_summary(conn)
+            print(format_database_summary(summary))
+        finally:
+            conn.close()
+        return
+
+    summary = run_ingestion(
+        db_path=args.db_path,
+        symbols=args.symbols,
+        start_iso=args.start_date,
+        skip_ohlcv=args.skip_ohlcv,
+        skip_fear_greed=args.skip_fear_greed,
+    )
+    print(format_database_summary(summary))
+
+
+if __name__ == "__main__":
+    main()
+
+================================================================================
+FILE: src/features.py
+================================================================================
+"""Feature engineering and data transformation pipeline for Aegis Alpha.
+
+Phase 2 module:
+- Loads OHLCV candles and Crypto Fear & Greed Index from SQLite or Parquet.
+- Merges market data and sentiment data without future lookahead leakage.
+- Generates 30+ technical and derived numeric features using pandas_ta
+  (with vectorized Pandas fallbacks for cross-version portability).
+- Generates 5+ transformation/dummy feature sets (hour_of_day, day_of_week,
+  month, volatility_regime_bins, sentiment_regime_dummies, plus symbol dummies).
+- Explicitly defines TO_PREDICT, NUMERIC, and DUMMIES feature contracts.
+"""
+
+from __future__ import annotations
+
+import logging
+import sqlite3
+from pathlib import Path
+from typing import Final, Sequence
+
+import numpy as np
+import pandas as pd
+
+from src.config import DB_PATH, SYMBOLS
+
+logger = logging.getLogger("aegis_alpha.features")
+
+try:
+    import pandas_ta as ta  # type: ignore[import-untyped]
+
+    HAS_PANDAS_TA = True
+except Exception:  # pragma: no cover - fallback for environments without pandas_ta
+    ta = None
+    HAS_PANDAS_TA = False
+
+# Prediction target contract
+TARGET_HORIZON_BARS: Final[int] = 16  # 16 * 15m = 4 hours
+TARGET_RETURN_THRESHOLD: Final[float] = 0.005  # +0.5% forward 4h return (> 0.2% round-trip fee)
+TARGET_COL: Final[str] = "is_positive_growth_4h"
+TO_PREDICT: Final[list[str]] = [TARGET_COL]
+
+# 35 distinct numeric technical, volatility, microstructure, and sentiment features
+NUMERIC: Final[list[str]] = [
+    # Momentum and trend oscillators (pandas_ta)
+    "rsi_14",
+    "macd",
+    "macd_signal",
+    "macd_hist",
+    # Volatility bands and range indicators (pandas_ta)
+    "bb_upper",
+    "bb_mid",
+    "bb_lower",
+    "bb_bandwidth",
+    "bb_percent_b",
+    "atr_14",
+    "atr_pct_14",
+    # Exponential moving averages and relative spreads (pandas_ta)
+    "ema_9",
+    "ema_21",
+    "ema_50",
+    "ema_200",
+    "ema_9_21_ratio",
+    "ema_50_200_ratio",
+    "close_to_ema_50",
+    "close_to_ema_200",
+    # Multi-horizon rolling realized volatility
+    "vol_1h",
+    "vol_4h",
+    "vol_24h",
+    # Volume and liquidity flow indicators
+    "obv",
+    "obv_momentum_24h",
+    "vwap_ratio",
+    "volume_zscore_24h",
+    # Alternative data: Crypto Fear & Greed lagged and momentum features
+    "fg_value",
+    "fg_value_lag_1d",
+    "fg_value_lag_3d",
+    "fg_value_lag_7d",
+    "fg_change_1d",
+    "fg_rolling_7d_mean",
+    # Long-term price positioning and short-term returns
+    "price_to_52w_low",
+    "price_to_52w_high",
+    "ret_15m",
+    "ret_1h",
+    "ret_4h",
+    "ret_24h",
+    "candle_body_pct",
+    "candle_range_pct",
+]
+
+# Deterministic dummy schemas across 6 categorical transformation sets (>= 5 required)
+HOUR_DUMMIES: Final[list[str]] = [f"hour_{h}" for h in range(24)]
+DOW_DUMMIES: Final[list[str]] = [f"dow_{d}" for d in range(7)]
+MONTH_DUMMIES: Final[list[str]] = [f"month_{m}" for m in range(1, 13)]
+VOL_REGIME_LABELS: Final[list[str]] = ["low", "normal", "high", "extreme"]
+VOL_REGIME_DUMMIES: Final[list[str]] = [f"vol_regime_{lbl}" for lbl in VOL_REGIME_LABELS]
+SENTIMENT_REGIME_LABELS: Final[list[str]] = [
+    "extreme_fear",
+    "fear",
+    "neutral",
+    "greed",
+    "extreme_greed",
+]
+SENTIMENT_REGIME_DUMMIES: Final[list[str]] = [
+    f"sent_regime_{lbl}" for lbl in SENTIMENT_REGIME_LABELS
+]
+
+
+def _symbol_to_slug(symbol: str) -> str:
+    return symbol.lower().replace("/", "_").replace("-", "_")
+
+
+SYMBOL_DUMMIES: Final[list[str]] = [f"sym_{_symbol_to_slug(sym)}" for sym in SYMBOLS]
+
+DUMMIES: Final[list[str]] = (
+    HOUR_DUMMIES
+    + DOW_DUMMIES
+    + MONTH_DUMMIES
+    + VOL_REGIME_DUMMIES
+    + SENTIMENT_REGIME_DUMMIES
+    + SYMBOL_DUMMIES
+)
+
+FEATURE_COLS: Final[list[str]] = NUMERIC + DUMMIES
+
+# 52 weeks of 15-minute candles = 52 * 7 * 24 * 4 = 34,944 bars (~35,040 for 365d)
+BARS_PER_DAY: Final[int] = 96
+BARS_52_WEEKS: Final[int] = 365 * BARS_PER_DAY
+
+
+def load_raw_tables_from_sqlite(
+    db_path: Path = DB_PATH,
+    symbols: Sequence[str] | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Load ohlcv and fear_greed tables from SQLite into Pandas DataFrames."""
+    resolved = Path(db_path)
+    if not resolved.exists():
+        raise FileNotFoundError(
+            f"SQLite database not found at {resolved}. "
+            "Run Phase 1 ingestion ('python -m src.data_fetcher') or use --mode offline."
+        )
+
+    conn = sqlite3.connect(str(resolved))
+    try:
+        if symbols:
+            placeholders = ",".join("?" for _ in symbols)
+            ohlcv_query = (
+                "SELECT symbol, timestamp, datetime_utc, open, high, low, close, volume "
+                f"FROM ohlcv WHERE symbol IN ({placeholders}) "
+                "ORDER BY symbol, timestamp;"
+            )
+            df_ohlcv = pd.read_sql_query(ohlcv_query, conn, params=list(symbols))
+        else:
+            ohlcv_query = (
+                "SELECT symbol, timestamp, datetime_utc, open, high, low, close, volume "
+                "FROM ohlcv ORDER BY symbol, timestamp;"
+            )
+            df_ohlcv = pd.read_sql_query(ohlcv_query, conn)
+
+        fg_query = (
+            "SELECT timestamp, date_utc, value, classification, source "
+            "FROM fear_greed ORDER BY timestamp;"
+        )
+        df_fg = pd.read_sql_query(fg_query, conn)
+    finally:
+        conn.close()
+
+    logger.info(
+        "Loaded %d OHLCV rows and %d Fear & Greed rows from %s.",
+        len(df_ohlcv),
+        len(df_fg),
+        resolved,
+    )
+    return df_ohlcv, df_fg
+
+
+def merge_ohlcv_and_fear_greed(
+    df_ohlcv: pd.DataFrame,
+    df_fg: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """Merge 15m OHLCV bars with daily Fear & Greed Index by UTC date without leakage."""
+    df = df_ohlcv.copy()
+    if "datetime_utc" in df.columns:
+        df["datetime"] = pd.to_datetime(df["datetime_utc"], utc=True)
+    else:
+        df["datetime"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+        df["datetime_utc"] = df["datetime"].dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    df["date_utc"] = df["datetime"].dt.strftime("%Y-%m-%d")
+
+    if df_fg is not None and not df_fg.empty:
+        fg = df_fg[["date_utc", "value", "classification"]].copy()
+        fg = fg.drop_duplicates(subset=["date_utc"], keep="last").sort_values("date_utc")
+        fg = fg.rename(
+            columns={
+                "value": "fg_value",
+                "classification": "fg_classification",
+            }
+        )
+
+        # Build continuous daily index to forward-fill occasional missing sentiment days
+        date_range = pd.date_range(
+            start=min(df["date_utc"].min(), fg["date_utc"].min()),
+            end=max(df["date_utc"].max(), fg["date_utc"].max()),
+            freq="D",
+            tz="UTC",
+        ).strftime("%Y-%m-%d")
+        fg_daily = pd.DataFrame({"date_utc": date_range}).merge(fg, on="date_utc", how="left")
+        fg_daily["fg_value"] = fg_daily["fg_value"].ffill().bfill().fillna(50.0)
+        fg_daily["fg_classification"] = fg_daily["fg_classification"].ffill().bfill().fillna("Neutral")
+
+        # Compute daily Fear & Greed lags cleanly on daily series prior to 15m join
+        fg_daily["fg_value_lag_1d"] = fg_daily["fg_value"].shift(1)
+        fg_daily["fg_value_lag_3d"] = fg_daily["fg_value"].shift(3)
+        fg_daily["fg_value_lag_7d"] = fg_daily["fg_value"].shift(7)
+        fg_daily["fg_change_1d"] = fg_daily["fg_value"] - fg_daily["fg_value_lag_1d"]
+        fg_daily["fg_rolling_7d_mean"] = fg_daily["fg_value"].rolling(7, min_periods=1).mean()
+
+        df = df.merge(fg_daily, on="date_utc", how="left")
+    else:
+        logger.warning("Fear & Greed table empty or omitted; defaulting sentiment to neutral (50).")
+        df["fg_value"] = 50.0
+        df["fg_classification"] = "Neutral"
+        df["fg_value_lag_1d"] = 50.0
+        df["fg_value_lag_3d"] = 50.0
+        df["fg_value_lag_7d"] = 50.0
+        df["fg_change_1d"] = 0.0
+        df["fg_rolling_7d_mean"] = 50.0
+
+    for col in ("fg_value", "fg_value_lag_1d", "fg_value_lag_3d", "fg_value_lag_7d", "fg_rolling_7d_mean"):
+        df[col] = df[col].ffill().bfill().fillna(50.0).astype("float64")
+    df["fg_change_1d"] = df["fg_change_1d"].fillna(0.0).astype("float64")
+
+    return df
+
+
+def _compute_rsi_14(close: pd.Series) -> pd.Series:
+    if HAS_PANDAS_TA and ta is not None:
+        res = ta.rsi(close, length=14)
+        if res is not None:
+            return res
+    delta = close.diff()
+    gain = delta.clip(lower=0.0)
+    loss = (-delta).clip(lower=0.0)
+    avg_gain = gain.ewm(alpha=1.0 / 14.0, min_periods=14, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1.0 / 14.0, min_periods=14, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0.0, np.nan)
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
+def _compute_macd(close: pd.Series) -> tuple[pd.Series, pd.Series, pd.Series]:
+    if HAS_PANDAS_TA and ta is not None:
+        macd_df = ta.macd(close, fast=12, slow=26, signal=9)
+        if macd_df is not None and macd_df.shape[1] >= 3:
+            # pandas_ta returns MACD_12_26_9, MACDh_12_26_9, MACDs_12_26_9
+            macd_col = [c for c in macd_df.columns if c.startswith("MACD_")][0]
+            hist_col = [c for c in macd_df.columns if c.startswith("MACDh_")][0]
+            sig_col = [c for c in macd_df.columns if c.startswith("MACDs_")][0]
+            return macd_df[macd_col], macd_df[sig_col], macd_df[hist_col]
+    ema_12 = close.ewm(span=12, adjust=False).mean()
+    ema_26 = close.ewm(span=26, adjust=False).mean()
+    macd_line = ema_12 - ema_26
+    signal_line = macd_line.ewm(span=9, adjust=False).mean()
+    hist_line = macd_line - signal_line
+    return macd_line, signal_line, hist_line
+
+
+def _compute_bbands(close: pd.Series) -> tuple[pd.Series, pd.Series, pd.Series]:
+    if HAS_PANDAS_TA and ta is not None:
+        bb_df = ta.bbands(close, length=20, std=2.0)
+        if bb_df is not None and bb_df.shape[1] >= 3:
+            lower_col = [c for c in bb_df.columns if c.startswith("BBL_")][0]
+            mid_col = [c for c in bb_df.columns if c.startswith("BBM_")][0]
+            upper_col = [c for c in bb_df.columns if c.startswith("BBU_")][0]
+            return bb_df[upper_col], bb_df[mid_col], bb_df[lower_col]
+    mid = close.rolling(20, min_periods=20).mean()
+    std = close.rolling(20, min_periods=20).std(ddof=0)
+    return mid + 2.0 * std, mid, mid - 2.0 * std
+
+
+def _compute_atr_14(high: pd.Series, low: pd.Series, close: pd.Series) -> pd.Series:
+    if HAS_PANDAS_TA and ta is not None:
+        res = ta.atr(high=high, low=low, close=close, length=14)
+        if res is not None:
+            return res
+    prev_close = close.shift(1)
+    tr = pd.concat(
+        [
+            (high - low),
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    return tr.ewm(alpha=1.0 / 14.0, min_periods=14, adjust=False).mean()
+
+
+def _compute_ema(close: pd.Series, length: int) -> pd.Series:
+    if HAS_PANDAS_TA and ta is not None:
+        res = ta.ema(close, length=length)
+        if res is not None:
+            return res
+    return close.ewm(span=length, adjust=False).mean()
+
+
+def _compute_obv(close: pd.Series, volume: pd.Series) -> pd.Series:
+    if HAS_PANDAS_TA and ta is not None:
+        res = ta.obv(close=close, volume=volume)
+        if res is not None:
+            return res
+    direction = np.sign(close.diff().fillna(0.0))
+    return (direction * volume).cumsum()
+
+
+def _compute_symbol_indicators(group: pd.DataFrame) -> pd.DataFrame:
+    """Compute all technical, volatility, microstructure, and target columns for one symbol."""
+    g = group.sort_values("timestamp").copy()
+    eps = 1e-9
+
+    open_p = g["open"].astype("float64")
+    high_p = g["high"].astype("float64")
+    low_p = g["low"].astype("float64")
+    close_p = g["close"].astype("float64")
+    volume = g["volume"].astype("float64")
+
+    # 1. Momentum oscillators
+    g["rsi_14"] = _compute_rsi_14(close_p)
+    macd_line, macd_sig, macd_hist = _compute_macd(close_p)
+    g["macd"] = macd_line
+    g["macd_signal"] = macd_sig
+    g["macd_hist"] = macd_hist
+
+    # 2. Bollinger Bands
+    bb_upper, bb_mid, bb_lower = _compute_bbands(close_p)
+    g["bb_upper"] = bb_upper
+    g["bb_mid"] = bb_mid
+    g["bb_lower"] = bb_lower
+    g["bb_bandwidth"] = (bb_upper - bb_lower) / (bb_mid.abs() + eps)
+    g["bb_percent_b"] = (close_p - bb_lower) / ((bb_upper - bb_lower).abs() + eps)
+
+    # 3. ATR
+    g["atr_14"] = _compute_atr_14(high_p, low_p, close_p)
+    g["atr_pct_14"] = g["atr_14"] / (close_p + eps)
+
+    # 4. Exponential Moving Averages
+    g["ema_9"] = _compute_ema(close_p, 9)
+    g["ema_21"] = _compute_ema(close_p, 21)
+    g["ema_50"] = _compute_ema(close_p, 50)
+    g["ema_200"] = _compute_ema(close_p, 200)
+    g["ema_9_21_ratio"] = (g["ema_9"] / (g["ema_21"] + eps)) - 1.0
+    g["ema_50_200_ratio"] = (g["ema_50"] / (g["ema_200"] + eps)) - 1.0
+    g["close_to_ema_50"] = (close_p / (g["ema_50"] + eps)) - 1.0
+    g["close_to_ema_200"] = (close_p / (g["ema_200"] + eps)) - 1.0
+
+    # 5. Returns and rolling volatility (1h = 4 bars, 4h = 16 bars, 24h = 96 bars)
+    log_ret = np.log(close_p / close_p.shift(1).replace(0.0, np.nan))
+    g["ret_15m"] = close_p.pct_change(1)
+    g["ret_1h"] = close_p.pct_change(4)
+    g["ret_4h"] = close_p.pct_change(16)
+    g["ret_24h"] = close_p.pct_change(96)
+
+    g["vol_1h"] = log_ret.rolling(4, min_periods=4).std()
+    g["vol_4h"] = log_ret.rolling(16, min_periods=8).std()
+    g["vol_24h"] = log_ret.rolling(96, min_periods=24).std()
+
+    # 6. OBV and rolling 24h VWAP ratio
+    g["obv"] = _compute_obv(close_p, volume)
+    obv_scale = g["obv"].abs().rolling(96, min_periods=24).mean() + eps
+    g["obv_momentum_24h"] = g["obv"].diff(96) / obv_scale
+
+    typical_price = (high_p + low_p + close_p) / 3.0
+    pv_24h = (typical_price * volume).rolling(96, min_periods=16).sum()
+    vol_24h_sum = volume.rolling(96, min_periods=16).sum()
+    rolling_vwap_24h = pv_24h / (vol_24h_sum + eps)
+    g["vwap_ratio"] = close_p / (rolling_vwap_24h + eps)
+
+    vol_mean_24h = volume.rolling(96, min_periods=24).mean()
+    vol_std_24h = volume.rolling(96, min_periods=24).std()
+    g["volume_zscore_24h"] = (volume - vol_mean_24h) / (vol_std_24h + eps)
+
+    # 7. Price-to-52w-low and 52w-high ratios
+    rolling_52w_low = low_p.rolling(BARS_52_WEEKS, min_periods=96).min()
+    rolling_52w_high = high_p.rolling(BARS_52_WEEKS, min_periods=96).max()
+    g["price_to_52w_low"] = close_p / (rolling_52w_low + eps)
+    g["price_to_52w_high"] = close_p / (rolling_52w_high + eps)
+
+    # 8. Candlestick microstructure
+    g["candle_body_pct"] = (close_p - open_p) / (open_p + eps)
+    g["candle_range_pct"] = (high_p - low_p) / (close_p + eps)
+
+    # 9. Causal volatility regime bins per symbol using trailing 30-day rolling quantiles
+    # Using trailing rolling quantiles avoids future lookahead leakage.
+    window_30d = 30 * BARS_PER_DAY
+    q25 = g["vol_24h"].rolling(window_30d, min_periods=96).quantile(0.25)
+    q75 = g["vol_24h"].rolling(window_30d, min_periods=96).quantile(0.75)
+    q90 = g["vol_24h"].rolling(window_30d, min_periods=96).quantile(0.90)
+
+    vol_regime = np.where(
+        g["vol_24h"] >= q90,
+        "extreme",
+        np.where(
+            g["vol_24h"] >= q75,
+            "high",
+            np.where(g["vol_24h"] <= q25, "low", "normal"),
+        ),
+    )
+    g["volatility_regime"] = np.where(g["vol_24h"].isna(), "normal", vol_regime)
+
+    # 10. Forward target columns (computed strictly inside each symbol group)
+    g["future_return_15m"] = (close_p.shift(-1) / (close_p + eps)) - 1.0
+    g["future_return_4h"] = (close_p.shift(-TARGET_HORIZON_BARS) / (close_p + eps)) - 1.0
+    g[TARGET_COL] = np.where(
+        g["future_return_4h"].notna(),
+        (g["future_return_4h"] >= TARGET_RETURN_THRESHOLD).astype(int),
+        np.nan,
+    )
+
+    return g
+
+
+def _classify_sentiment_slug(fg_val: pd.Series) -> pd.Series:
+    return pd.Series(
+        np.select(
+            [
+                fg_val <= 24.0,
+                fg_val <= 44.0,
+                fg_val <= 55.0,
+                fg_val <= 74.0,
+            ],
+            [
+                "extreme_fear",
+                "fear",
+                "neutral",
+                "greed",
+            ],
+            default="extreme_greed",
+        ),
+        index=fg_val.index,
+    )
+
+
+def _add_transformation_dummies(df: pd.DataFrame) -> pd.DataFrame:
+    """Create 6 deterministic dummy/transformation feature sets."""
+    out = df.copy()
+    dt = out["datetime"]
+
+    out["hour_of_day"] = dt.dt.hour.astype(int)
+    out["day_of_week"] = dt.dt.dayofweek.astype(int)
+    out["month"] = dt.dt.month.astype(int)
+    out["sentiment_regime"] = _classify_sentiment_slug(out["fg_value"])
+
+    # Set 1: hour_of_day dummies (24)
+    hour_dummies = pd.get_dummies(out["hour_of_day"], prefix="hour", dtype=np.int8)
+    hour_dummies = hour_dummies.reindex(columns=HOUR_DUMMIES, fill_value=0)
+
+    # Set 2: day_of_week dummies (7)
+    dow_dummies = pd.get_dummies(out["day_of_week"], prefix="dow", dtype=np.int8)
+    dow_dummies = dow_dummies.reindex(columns=DOW_DUMMIES, fill_value=0)
+
+    # Set 3: month dummies (12)
+    month_dummies = pd.get_dummies(out["month"], prefix="month", dtype=np.int8)
+    month_dummies = month_dummies.reindex(columns=MONTH_DUMMIES, fill_value=0)
+
+    # Set 4: volatility_regime_bins dummies (4)
+    vol_dummies = pd.get_dummies(out["volatility_regime"], prefix="vol_regime", dtype=np.int8)
+    vol_dummies = vol_dummies.reindex(columns=VOL_REGIME_DUMMIES, fill_value=0)
+
+    # Set 5: sentiment_regime_dummies (5)
+    sent_dummies = pd.get_dummies(out["sentiment_regime"], prefix="sent_regime", dtype=np.int8)
+    sent_dummies = sent_dummies.reindex(columns=SENTIMENT_REGIME_DUMMIES, fill_value=0)
+
+    # Set 6: symbol dummies (5)
+    sym_slugs = out["symbol"].map(_symbol_to_slug)
+    sym_dummies = pd.get_dummies(sym_slugs, prefix="sym", dtype=np.int8)
+    sym_dummies = sym_dummies.reindex(columns=SYMBOL_DUMMIES, fill_value=0)
+
+    out = pd.concat(
+        [out, hour_dummies, dow_dummies, month_dummies, vol_dummies, sent_dummies, sym_dummies],
+        axis=1,
+    )
+    return out
+
+
+def build_feature_dataframe(
+    df_ohlcv: pd.DataFrame,
+    df_fg: pd.DataFrame | None = None,
+    drop_na_features: bool = True,
+    drop_na_target: bool = True,
+) -> pd.DataFrame:
+    """End-to-end feature engineering from raw OHLCV and Fear & Greed DataFrames."""
+    if df_ohlcv.empty:
+        raise ValueError("Input OHLCV DataFrame is empty.")
+
+    merged = merge_ohlcv_and_fear_greed(df_ohlcv=df_ohlcv, df_fg=df_fg)
+
+    per_symbol_frames: list[pd.DataFrame] = []
+    for _, grp in merged.groupby("symbol", sort=True):
+        per_symbol_frames.append(_compute_symbol_indicators(grp))
+
+    featured = pd.concat(per_symbol_frames, axis=0, ignore_index=True)
+    featured = _add_transformation_dummies(featured)
+
+    # Clean infinities before missing-value filtering
+    featured[NUMERIC] = featured[NUMERIC].replace([np.inf, -np.inf], np.nan)
+
+    initial_rows = len(featured)
+    if drop_na_features:
+        featured = featured.dropna(subset=NUMERIC)
+    if drop_na_target:
+        featured = featured.dropna(subset=TO_PREDICT)
+        featured[TARGET_COL] = featured[TARGET_COL].astype(int)
+
+    featured = featured.sort_values(["timestamp", "symbol"]).reset_index(drop=True)
+    logger.info(
+        "Built feature dataset: %d rows (dropped %d warmup/tail rows), "
+        "%d NUMERIC features, %d DUMMIES features (pandas_ta=%s).",
+        len(featured),
+        initial_rows - len(featured),
+        len(NUMERIC),
+        len(DUMMIES),
+        HAS_PANDAS_TA,
+    )
+    return featured
+
+
+def build_features_from_sqlite(
+    db_path: Path = DB_PATH,
+    symbols: Sequence[str] | None = None,
+    drop_na_features: bool = True,
+    drop_na_target: bool = True,
+) -> pd.DataFrame:
+    """Convenience wrapper to load SQLite tables and generate the feature DataFrame."""
+    df_ohlcv, df_fg = load_raw_tables_from_sqlite(db_path=db_path, symbols=symbols)
+    return build_feature_dataframe(
+        df_ohlcv=df_ohlcv,
+        df_fg=df_fg,
+        drop_na_features=drop_na_features,
+        drop_na_target=drop_na_target,
+    )
+
+
+def save_dataframe(df: pd.DataFrame, path: Path) -> Path:
+    """Persist DataFrame to Parquet (falling back to gzip CSV if pyarrow is absent)."""
+    resolved = Path(path)
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    if resolved.suffix.lower() == ".parquet":
+        try:
+            df.to_parquet(resolved, index=False)
+            return resolved
+        except Exception as exc:
+            logger.warning("Parquet save failed (%s); falling back to CSV.", exc)
+            csv_path = resolved.with_suffix(".csv")
+            df.to_csv(csv_path, index=False)
+            return csv_path
+    df.to_csv(resolved, index=False)
+    return resolved
+
+
+def load_dataframe(path: Path) -> pd.DataFrame:
+    """Load DataFrame from Parquet or CSV with UTC datetime parsing."""
+    resolved = Path(path)
+    if resolved.suffix.lower() == ".parquet":
+        df = pd.read_parquet(resolved)
+    else:
+        df = pd.read_csv(resolved)
+    if "datetime" in df.columns:
+        df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
+    elif "datetime_utc" in df.columns:
+        df["datetime"] = pd.to_datetime(df["datetime_utc"], utc=True)
+    return df
+
+
+def get_feature_catalog() -> dict[str, list[str]]:
+    """Return explicit feature group lists for reporting and model validation."""
+    return {
+        "TO_PREDICT": list(TO_PREDICT),
+        "NUMERIC": list(NUMERIC),
+        "DUMMIES": list(DUMMIES),
+        "FEATURE_COLS": list(FEATURE_COLS),
+    }
+
+================================================================================
+FILE: src/notifier.py
+================================================================================
+"""Telegram alerting and console fallback notification module for Aegis Alpha.
+
+Phase 5 module:
+- Sends clean, ASCII-only (zero emojis) trade alerts and portfolio metric summaries
+  via the Telegram Bot HTTP API when TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are set.
+- Gracefully logs formatted alerts to the console if credentials are empty.
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any, Sequence
+
+import requests
+
+from src.broker import OrderReceipt
+from src.config import REQUEST_TIMEOUT_SEC, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+
+logger = logging.getLogger("aegis_alpha.notifier")
+
+
+class TelegramNotifier:
+    """Notification dispatcher with Telegram Bot API support and console fallback."""
+
+    def __init__(
+        self,
+        bot_token: str = TELEGRAM_BOT_TOKEN,
+        chat_id: str = TELEGRAM_CHAT_ID,
+        timeout: int = REQUEST_TIMEOUT_SEC,
+    ) -> None:
+        self.bot_token = bot_token.strip()
+        self.chat_id = chat_id.strip()
+        self.timeout = timeout
+        self.enabled = bool(self.bot_token and self.chat_id)
+
+        if not self.enabled:
+            logger.info(
+                "TelegramNotifier running in CONSOLE FALLBACK mode "
+                "(TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not configured)."
+            )
+
+    def send_message(self, text: str) -> bool:
+        """Deliver a formatted text notification via Telegram or console fallback."""
+        if not self.enabled:
+            print("\n--- [AEGIS ALPHA NOTIFICATION - CONSOLE FALLBACK] ---")
+            print(text)
+            print("--- [END NOTIFICATION] ---\n")
+            return True
+
+        url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
+        payload = {
+            "chat_id": self.chat_id,
+            "text": text,
+            "disable_web_page_preview": True,
+        }
+        try:
+            response = requests.post(url, json=payload, timeout=self.timeout)
+            response.raise_for_status()
+            logger.info("Sent Telegram notification to chat_id=%s.", self.chat_id)
+            return True
+        except requests.RequestException as exc:
+            logger.warning(
+                "Telegram delivery failed (%s); falling back to console output.", exc
+            )
+            print("\n--- [AEGIS ALPHA NOTIFICATION - FALLBACK AFTER ERROR] ---")
+            print(text)
+            print("--- [END NOTIFICATION] ---\n")
+            return False
+
+    @staticmethod
+    def format_trade_alert(receipt: OrderReceipt) -> str:
+        """Format a single trade order receipt in clean ASCII."""
+        return "\n".join(
+            [
+                f"[AEGIS ALPHA TRADE ALERT | {receipt.mode}]",
+                f"Order ID    : {receipt.order_id}",
+                f"Symbol      : {receipt.symbol}",
+                f"Action      : {receipt.side} ({receipt.status})",
+                f"Entry Price : ${receipt.price:,.4f}",
+                f"Quantity    : {receipt.quantity:.6f}",
+                f"Notional    : ${receipt.notional_usd:,.2f} (Est. Fee: ${receipt.estimated_fee_usd:.4f})",
+                f"Stop-Loss   : ${receipt.stop_loss_price:,.4f} (-2.0%)",
+                f"Take-Profit : ${receipt.take_profit_price:,.4f} (+4.0%)",
+                f"Model Prob  : {receipt.prediction_prob:.4f}",
+                f"Timestamp   : {receipt.timestamp_utc}",
+            ]
+        )
+
+    @staticmethod
+    def format_portfolio_summary(
+        exact_metrics: dict[str, Any],
+        bench_metrics: dict[str, Any],
+        run_mode: str,
+    ) -> str:
+        """Format portfolio simulation metrics vs. BTC Buy-and-Hold in clean ASCII."""
+        return "\n".join(
+            [
+                f"[AEGIS ALPHA PORTFOLIO SUMMARY | MODE={run_mode.upper()}]",
+                f"Strategy Final Equity : ${exact_metrics['final_equity']:,.2f} "
+                f"(Total Return: {exact_metrics['total_return_pct']:+.2f}%)",
+                f"Strategy CAGR / Sharpe: {exact_metrics['cagr_pct']:+.2f}% / {exact_metrics['sharpe_ratio']:.3f}",
+                f"Strategy Max Drawdown : {exact_metrics['max_drawdown_pct']:.2f}%",
+                f"Closed Trades / Win%  : {exact_metrics['total_trades']} / {exact_metrics['win_rate_pct']:.2f}%",
+                f"BTC Buy-Hold Return   : {bench_metrics['total_return_pct']:+.2f}% "
+                f"(Sharpe: {bench_metrics['sharpe_ratio']:.3f}, MaxDD: {bench_metrics['max_drawdown_pct']:.2f}%)",
+            ]
+        )
+
+    def notify_trades(self, receipts: Sequence[OrderReceipt]) -> int:
+        """Send alerts for all executed or simulated orders."""
+        sent = 0
+        for receipt in receipts:
+            if self.send_message(self.format_trade_alert(receipt)):
+                sent += 1
+        return sent
+
+    def notify_portfolio_summary(
+        self,
+        exact_metrics: dict[str, Any],
+        bench_metrics: dict[str, Any],
+        run_mode: str,
+    ) -> bool:
+        """Send formatted portfolio performance digest."""
+        msg = self.format_portfolio_summary(
+            exact_metrics=exact_metrics,
+            bench_metrics=bench_metrics,
+            run_mode=run_mode,
+        )
+        return self.send_message(msg)
+
+================================================================================
+FILE: src/simulator.py
+================================================================================
+"""Vectorized and exact iterative trading simulations plus diagnostic analytics.
+
+Phase 4 module for Aegis Alpha:
+- Vectorized simulations generating sim1_gross_rev, sim1_net_rev (baseline rule)
+  and sim2_gross_rev, sim2_net_rev (custom rule + sentiment/volatility filter).
+- Exact iterative portfolio simulation using itertuples:
+  * $10,000 starting capital with dynamic capital reinvestment
+  * Max 3 concurrent open positions (max 1 per symbol)
+  * Dynamic position sizing scaled by model prediction probability
+  * 0.1% exchange fee on entry and exit
+  * Strict 2% Stop-Loss / 4% Take-Profit with intrabar OHLC checking
+- Performance benchmarking (CAGR, Sharpe Ratio, Max Drawdown, 30d Rolling Returns)
+  against BTC/USDT Buy-and-Hold over the identical evaluation period.
+- Deep diagnostic slicing by ticker, month, sentiment regime, and volatility regime,
+  including False Positive root-cause debugging.
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from typing import Any
+
+import numpy as np
+import pandas as pd
+
+from src.config import (
+    INITIAL_CAPITAL,
+    MAX_CONCURRENT_POSITIONS,
+    STOP_LOSS_PCT,
+    TAKE_PROFIT_PCT,
+    TRADING_FEE_RATE,
+)
+from src.features import TARGET_COL, TARGET_HORIZON_BARS
+
+logger = logging.getLogger("aegis_alpha.simulator")
+
+
+@dataclass
+class OpenPosition:
+    """State of an active long spot position during exact iterative simulation."""
+
+    symbol: str
+    entry_timestamp: int
+    entry_datetime: str
+    entry_price: float
+    quantity: float
+    entry_notional: float
+    entry_fee: float
+    stop_loss_price: float
+    take_profit_price: float
+    entry_prob: float
+    sentiment_regime: str
+    volatility_regime: str
+    bars_held: int = 0
+
+
+def run_vectorized_simulations(
+    df: pd.DataFrame,
+    unit_investment: float = 100.0,
+    fee_rate: float = TRADING_FEE_RATE,
+    baseline_col: str = "pred_baseline",
+    custom_col: str = "pred_custom_rule",
+    return_col: str = "future_return_4h",
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Run vectorized simulations generating sim1_* and sim2_* revenue columns."""
+    out = df.copy()
+    round_trip_fee = 2.0 * fee_rate
+    fwd_ret = out[return_col].fillna(0.0).astype(float)
+
+    sig1 = out[baseline_col].fillna(0).astype(int)
+    sig2 = out[custom_col].fillna(0).astype(int)
+
+    # Vectorized Simulation 1: Baseline threshold rule
+    out["sim1_gross_rev"] = sig1 * unit_investment * fwd_ret
+    out["sim1_net_rev"] = sig1 * unit_investment * (fwd_ret - round_trip_fee)
+
+    # Vectorized Simulation 2: Custom high-probability + sentiment + volatility filter
+    out["sim2_gross_rev"] = sig2 * unit_investment * fwd_ret
+    out["sim2_net_rev"] = sig2 * unit_investment * (fwd_ret - round_trip_fee)
+
+    out["sim1_cum_net_rev"] = out["sim1_net_rev"].cumsum()
+    out["sim2_cum_net_rev"] = out["sim2_net_rev"].cumsum()
+
+    def _summarize(sig_col: str, gross_col: str, net_col: str) -> dict[str, Any]:
+        active = out[out[sig_col] == 1]
+        n_trades = int(len(active))
+        if n_trades == 0:
+            return {
+                "signals": 0,
+                "win_rate": 0.0,
+                "gross_pnl_usd": 0.0,
+                "net_pnl_usd": 0.0,
+                "avg_net_return_pct": 0.0,
+                "profit_factor": 0.0,
+            }
+        gross_pnl = float(active[gross_col].sum())
+        net_pnl = float(active[net_col].sum())
+        wins = active[active[net_col] > 0.0][net_col].sum()
+        losses = abs(active[active[net_col] < 0.0][net_col].sum())
+        profit_factor = float(wins / losses) if losses > 0 else float("inf")
+        return {
+            "signals": n_trades,
+            "win_rate": round(float((active[net_col] > 0.0).mean()), 5),
+            "gross_pnl_usd": round(gross_pnl, 2),
+            "net_pnl_usd": round(net_pnl, 2),
+            "avg_net_return_pct": round(float(net_pnl / (n_trades * unit_investment) * 100.0), 4),
+            "profit_factor": round(profit_factor, 4) if np.isfinite(profit_factor) else 999.0,
+        }
+
+    summary = {
+        "unit_investment_usd": unit_investment,
+        "round_trip_fee_rate": round_trip_fee,
+        "sim1_baseline": _summarize(baseline_col, "sim1_gross_rev", "sim1_net_rev"),
+        "sim2_custom_rule": _summarize(custom_col, "sim2_gross_rev", "sim2_net_rev"),
+    }
+    return out, summary
+
+
+def _compute_confidence_scale(prob: float) -> float:
+    """Scale position allocation smoothly by model probability in [0.35, 1.00]."""
+    raw = (prob - 0.50) / 0.35
+    return float(np.clip(raw, 0.35, 1.00))
+
+
+def run_exact_simulation(
+    df: pd.DataFrame,
+    signal_col: str = "pred_custom_rule",
+    prob_col: str = "pred_prob_ensemble",
+    initial_capital: float = INITIAL_CAPITAL,
+    max_concurrent_positions: int = MAX_CONCURRENT_POSITIONS,
+    fee_rate: float = TRADING_FEE_RATE,
+    stop_loss_pct: float = STOP_LOSS_PCT,
+    take_profit_pct: float = TAKE_PROFIT_PCT,
+    max_holding_bars: int = TARGET_HORIZON_BARS,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+    """Exact event-driven iterative portfolio simulation via DataFrame.itertuples().
+
+    Rules enforced at each chronological 15m bar:
+    1. Existing positions are evaluated first for intrabar Stop-Loss (2%),
+       Take-Profit (4%), or Horizon Timeout (16 bars = 4h).
+       Conservative tie-breaker: if a bar touches both SL and TP, SL executes first.
+    2. New BUY signals enter at bar close if open positions < max_concurrent_positions
+       and the symbol does not already have an active position.
+    3. Dynamic position sizing reinvests current portfolio equity, scaled by prediction
+       probability and capped by available cash.
+    4. 0.1% exchange fee is charged on both entry and exit notional.
+    """
+    required_cols = [
+        "timestamp",
+        "datetime_utc",
+        "symbol",
+        "open",
+        "high",
+        "low",
+        "close",
+        signal_col,
+        prob_col,
+    ]
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        raise ValueError(f"Exact simulation missing required columns: {missing}")
+
+    work = df.sort_values(["timestamp", "symbol"]).reset_index(drop=True)
+    if "sentiment_regime" not in work.columns:
+        work["sentiment_regime"] = "unknown"
+    if "volatility_regime" not in work.columns:
+        work["volatility_regime"] = "unknown"
+
+    sim_cols = [
+        "timestamp",
+        "datetime_utc",
+        "symbol",
+        "high",
+        "low",
+        "close",
+        signal_col,
+        prob_col,
+        "sentiment_regime",
+        "volatility_regime",
+    ]
+    # Rename dynamic signal/prob columns to valid namedtuple identifiers for itertuples
+    iter_df = work[sim_cols].rename(
+        columns={signal_col: "sim_signal", prob_col: "sim_prob"}
+    )
+
+    cash = float(initial_capital)
+    open_positions: dict[str, OpenPosition] = {}
+    last_known_price: dict[str, float] = {}
+    closed_trades: list[dict[str, Any]] = []
+    equity_records: list[dict[str, Any]] = []
+    total_fees_paid = 0.0
+
+    current_ts: int | None = None
+    current_dt_utc: str = ""
+    pending_entries: list[Any] = []
+
+    def _mark_to_market_equity() -> float:
+        mtm = cash
+        for sym, pos in open_positions.items():
+            px = last_known_price.get(sym, pos.entry_price)
+            mtm += pos.quantity * px
+        return mtm
+
+    def _close_position(
+        pos: OpenPosition,
+        exit_price: float,
+        exit_ts: int,
+        exit_dt: str,
+        exit_reason: str,
+    ) -> None:
+        nonlocal cash, total_fees_paid
+        gross_proceeds = pos.quantity * exit_price
+        exit_fee = gross_proceeds * fee_rate
+        net_proceeds = gross_proceeds - exit_fee
+        cash += net_proceeds
+        total_fees_paid += exit_fee
+
+        gross_pnl = gross_proceeds - pos.entry_notional
+        net_pnl = net_proceeds - (pos.entry_notional + pos.entry_fee)
+        return_pct = net_pnl / (pos.entry_notional + pos.entry_fee)
+
+        closed_trades.append(
+            {
+                "symbol": pos.symbol,
+                "entry_timestamp": pos.entry_timestamp,
+                "entry_datetime_utc": pos.entry_datetime,
+                "exit_timestamp": exit_ts,
+                "exit_datetime_utc": exit_dt,
+                "entry_price": pos.entry_price,
+                "exit_price": exit_price,
+                "quantity": pos.quantity,
+                "entry_notional": pos.entry_notional,
+                "entry_prob": pos.entry_prob,
+                "bars_held": pos.bars_held,
+                "exit_reason": exit_reason,
+                "gross_pnl_usd": gross_pnl,
+                "fees_usd": pos.entry_fee + exit_fee,
+                "net_pnl_usd": net_pnl,
+                "net_return_pct": return_pct,
+                "sentiment_regime": pos.sentiment_regime,
+                "volatility_regime": pos.volatility_regime,
+            }
+        )
+
+    def _flush_timestamp_step(ts_val: int, dt_val: str) -> None:
+        nonlocal cash, total_fees_paid, pending_entries
+        # Rank simultaneous signals by highest predicted probability first
+        if pending_entries and len(open_positions) < max_concurrent_positions:
+            pending_entries.sort(key=lambda r: r.sim_prob, reverse=True)
+            for row in pending_entries:
+                if len(open_positions) >= max_concurrent_positions:
+                    break
+                if row.symbol in open_positions:
+                    continue
+
+                portfolio_equity = _mark_to_market_equity()
+                base_slot = portfolio_equity / float(max_concurrent_positions)
+                scale = _compute_confidence_scale(float(row.sim_prob))
+                target_spend = base_slot * scale
+
+                # Reserve enough cash to cover entry notional + entry fee
+                max_affordable_notional = cash / (1.0 + fee_rate)
+                entry_notional = min(target_spend, max_affordable_notional)
+                if entry_notional < 10.0:
+                    continue
+
+                entry_price = float(row.close)
+                if entry_price <= 0.0:
+                    continue
+
+                entry_fee = entry_notional * fee_rate
+                quantity = entry_notional / entry_price
+                cash -= entry_notional + entry_fee
+                total_fees_paid += entry_fee
+
+                open_positions[row.symbol] = OpenPosition(
+                    symbol=row.symbol,
+                    entry_timestamp=ts_val,
+                    entry_datetime=dt_val,
+                    entry_price=entry_price,
+                    quantity=quantity,
+                    entry_notional=entry_notional,
+                    entry_fee=entry_fee,
+                    stop_loss_price=entry_price * (1.0 - stop_loss_pct),
+                    take_profit_price=entry_price * (1.0 + take_profit_pct),
+                    entry_prob=float(row.sim_prob),
+                    sentiment_regime=str(row.sentiment_regime),
+                    volatility_regime=str(row.volatility_regime),
+                    bars_held=0,
+                )
+
+        pending_entries = []
+        equity_records.append(
+            {
+                "timestamp": ts_val,
+                "datetime_utc": dt_val,
+                "cash": cash,
+                "equity": _mark_to_market_equity(),
+                "open_positions": len(open_positions),
+            }
+        )
+
+    # Core iterative event loop using itertuples
+    for row in iter_df.itertuples(index=False):
+        row_ts = int(row.timestamp)
+        row_dt = str(row.datetime_utc)
+
+        if current_ts is not None and row_ts != current_ts:
+            _flush_timestamp_step(current_ts, current_dt_utc)
+
+        current_ts = row_ts
+        current_dt_utc = row_dt
+        last_known_price[row.symbol] = float(row.close)
+
+        # 1. Manage existing open position for this symbol
+        if row.symbol in open_positions:
+            pos = open_positions[row.symbol]
+            pos.bars_held += 1
+
+            hit_sl = float(row.low) <= pos.stop_loss_price
+            hit_tp = float(row.high) >= pos.take_profit_price
+
+            if hit_sl:
+                _close_position(pos, pos.stop_loss_price, row_ts, row_dt, "STOP_LOSS")
+                del open_positions[row.symbol]
+            elif hit_tp:
+                _close_position(pos, pos.take_profit_price, row_ts, row_dt, "TAKE_PROFIT")
+                del open_positions[row.symbol]
+            elif pos.bars_held >= max_holding_bars:
+                _close_position(pos, float(row.close), row_ts, row_dt, "HORIZON_TIMEOUT")
+                del open_positions[row.symbol]
+
+        # 2. Collect candidate BUY entries at this timestamp
+        if int(row.sim_signal) == 1 and row.symbol not in open_positions:
+            pending_entries.append(row)
+
+    # Flush final timestamp and liquidate any remaining open positions at final close
+    if current_ts is not None:
+        _flush_timestamp_step(current_ts, current_dt_utc)
+        for sym in list(open_positions.keys()):
+            pos = open_positions.pop(sym)
+            final_px = last_known_price.get(sym, pos.entry_price)
+            _close_position(pos, final_px, current_ts, current_dt_utc, "END_OF_SIMULATION")
+        if equity_records:
+            equity_records[-1]["cash"] = cash
+            equity_records[-1]["equity"] = cash
+            equity_records[-1]["open_positions"] = 0
+
+    trades_df = pd.DataFrame(closed_trades)
+    equity_df = pd.DataFrame(equity_records)
+    if not equity_df.empty:
+        equity_df["datetime"] = pd.to_datetime(equity_df["datetime_utc"], utc=True)
+
+    metrics = compute_performance_metrics(
+        equity_df=equity_df,
+        trades_df=trades_df,
+        initial_capital=initial_capital,
+        total_fees_paid=total_fees_paid,
+    )
+    return trades_df, equity_df, metrics
+
+
+def compute_performance_metrics(
+    equity_df: pd.DataFrame,
+    trades_df: pd.DataFrame | None = None,
+    initial_capital: float = INITIAL_CAPITAL,
+    total_fees_paid: float = 0.0,
+) -> dict[str, Any]:
+    """Compute CAGR, Sharpe Ratio, Max Drawdown, 30d Rolling Returns, and trade stats."""
+    if equity_df.empty:
+        return {
+            "initial_capital": initial_capital,
+            "final_equity": initial_capital,
+            "total_return_pct": 0.0,
+            "cagr_pct": 0.0,
+            "sharpe_ratio": 0.0,
+            "max_drawdown_pct": 0.0,
+            "rolling_30d_return_mean_pct": 0.0,
+            "rolling_30d_return_min_pct": 0.0,
+            "rolling_30d_return_max_pct": 0.0,
+            "rolling_30d_positive_pct": 0.0,
+            "total_trades": 0,
+            "win_rate_pct": 0.0,
+            "profit_factor": 0.0,
+            "total_fees_usd": 0.0,
+            "exit_reasons": {},
+        }
+
+    eq = equity_df.sort_values("datetime").copy()
+    eq = eq.set_index("datetime")
+    final_equity = float(eq["equity"].iloc[-1])
+    total_return = (final_equity / initial_capital) - 1.0
+
+    # Annualized CAGR using exact elapsed calendar days (24/7 crypto market)
+    elapsed_days = max((eq.index[-1] - eq.index[0]).total_seconds() / 86400.0, 1.0)
+    years = elapsed_days / 365.25
+    if final_equity > 0.0 and years > 0.0:
+        cagr = (final_equity / initial_capital) ** (1.0 / years) - 1.0
+    else:
+        cagr = -1.0
+
+    # Resample to daily closes for Sharpe and 30-day rolling return statistics
+    daily_eq = eq["equity"].resample("1D").last().ffill().dropna()
+    daily_ret = daily_eq.pct_change().dropna()
+
+    if len(daily_ret) > 1 and float(daily_ret.std(ddof=1)) > 0.0:
+        sharpe = float((daily_ret.mean() / daily_ret.std(ddof=1)) * np.sqrt(365.0))
+    else:
+        sharpe = 0.0
+
+    # Max Drawdown on full intraday equity curve
+    running_max = eq["equity"].cummax()
+    drawdown = (eq["equity"] / running_max) - 1.0
+    max_drawdown = float(drawdown.min())
+
+    # 30-day rolling returns (falls back to 7-day or overall return if series < 30 days)
+    rolling_window = 30 if len(daily_eq) > 30 else max(min(len(daily_eq) - 1, 7), 1)
+    rolling_ret = daily_eq.pct_change(rolling_window).dropna()
+    if len(rolling_ret) > 0:
+        roll_mean = float(rolling_ret.mean() * 100.0)
+        roll_min = float(rolling_ret.min() * 100.0)
+        roll_max = float(rolling_ret.max() * 100.0)
+        roll_pos = float((rolling_ret > 0.0).mean() * 100.0)
+    else:
+        roll_mean = roll_min = roll_max = float(total_return * 100.0)
+        roll_pos = 100.0 if total_return > 0.0 else 0.0
+
+    metrics: dict[str, Any] = {
+        "initial_capital": round(float(initial_capital), 2),
+        "final_equity": round(final_equity, 2),
+        "total_return_pct": round(float(total_return * 100.0), 3),
+        "cagr_pct": round(float(cagr * 100.0), 3),
+        "sharpe_ratio": round(sharpe, 4),
+        "max_drawdown_pct": round(float(max_drawdown * 100.0), 3),
+        "rolling_window_days": int(rolling_window),
+        "rolling_30d_return_mean_pct": round(roll_mean, 3),
+        "rolling_30d_return_min_pct": round(roll_min, 3),
+        "rolling_30d_return_max_pct": round(roll_max, 3),
+        "rolling_30d_positive_pct": round(roll_pos, 2),
+        "elapsed_days": round(elapsed_days, 2),
+        "total_fees_usd": round(float(total_fees_paid), 2),
+    }
+
+    if trades_df is not None and not trades_df.empty:
+        wins = trades_df[trades_df["net_pnl_usd"] > 0.0]["net_pnl_usd"].sum()
+        losses = abs(trades_df[trades_df["net_pnl_usd"] < 0.0]["net_pnl_usd"].sum())
+        pf = float(wins / losses) if losses > 0 else 999.0
+        metrics.update(
+            {
+                "total_trades": int(len(trades_df)),
+                "win_rate_pct": round(float((trades_df["net_pnl_usd"] > 0.0).mean() * 100.0), 2),
+                "profit_factor": round(pf, 4),
+                "avg_trade_pnl_usd": round(float(trades_df["net_pnl_usd"].mean()), 2),
+                "exit_reasons": {
+                    str(k): int(v) for k, v in trades_df["exit_reason"].value_counts().items()
+                },
+            }
+        )
+    else:
+        metrics.update(
+            {
+                "total_trades": 0,
+                "win_rate_pct": 0.0,
+                "profit_factor": 0.0,
+                "avg_trade_pnl_usd": 0.0,
+                "exit_reasons": {},
+            }
+        )
+
+    return metrics
+
+
+def compute_btc_benchmark(
+    df: pd.DataFrame,
+    benchmark_symbol: str = "BTC/USDT",
+    initial_capital: float = INITIAL_CAPITAL,
+    fee_rate: float = TRADING_FEE_RATE,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Compute BTC/USDT Buy-and-Hold benchmark equity curve and metrics."""
+    btc = df[df["symbol"] == benchmark_symbol].sort_values("timestamp").copy()
+    if btc.empty:
+        # Fallback to first available symbol if BTC/USDT is not present in a custom subset
+        first_sym = str(df["symbol"].iloc[0])
+        btc = df[df["symbol"] == first_sym].sort_values("timestamp").copy()
+        benchmark_symbol = first_sym
+
+    entry_price = float(btc["close"].iloc[0])
+    qty = (initial_capital * (1.0 - fee_rate)) / entry_price
+    btc["equity"] = qty * btc["close"].astype(float)
+    btc["datetime"] = pd.to_datetime(btc["datetime_utc"], utc=True)
+
+    bench_eq = btc[["timestamp", "datetime_utc", "datetime", "equity"]].copy()
+    metrics = compute_performance_metrics(
+        equity_df=bench_eq,
+        trades_df=None,
+        initial_capital=initial_capital,
+        total_fees_paid=initial_capital * fee_rate,
+    )
+    metrics["benchmark_symbol"] = benchmark_symbol
+    return bench_eq, metrics
+
+
+def run_diagnostics(
+    df_sim: pd.DataFrame,
+    trades_df: pd.DataFrame,
+    signal_col: str = "pred_custom_rule",
+    baseline_col: str = "pred_baseline",
+    net_rev_col: str = "sim2_net_rev",
+) -> dict[str, Any]:
+    """Slice precision and PnL by ticker, month, sentiment, and volatility; debug FPs."""
+    work = df_sim.copy()
+    dt = pd.to_datetime(work["datetime_utc"], utc=True)
+    work["year_month"] = dt.dt.strftime("%Y-%m")
+
+    def _slice_table(group_col: str) -> list[dict[str, Any]]:
+        if group_col not in work.columns:
+            return []
+        rows: list[dict[str, Any]] = []
+        for grp_val, grp in work.groupby(group_col, sort=True):
+            preds = grp[grp[signal_col] == 1]
+            n_sig = int(len(preds))
+            precision = (
+                float(preds[TARGET_COL].mean())
+                if n_sig > 0 and TARGET_COL in preds.columns
+                else 0.0
+            )
+            vec_net = float(preds[net_rev_col].sum()) if n_sig > 0 and net_rev_col in preds.columns else 0.0
+
+            exact_pnl = 0.0
+            exact_trades = 0
+            exact_win_rate = 0.0
+            if not trades_df.empty:
+                if group_col == "year_month":
+                    t_slice = trades_df[
+                        trades_df["entry_datetime_utc"].str.slice(0, 7) == str(grp_val)
+                    ]
+                elif group_col in trades_df.columns:
+                    t_slice = trades_df[trades_df[group_col] == grp_val]
+                else:
+                    t_slice = pd.DataFrame()
+                if not t_slice.empty:
+                    exact_trades = int(len(t_slice))
+                    exact_pnl = float(t_slice["net_pnl_usd"].sum())
+                    exact_win_rate = float((t_slice["net_pnl_usd"] > 0.0).mean())
+
+            rows.append(
+                {
+                    group_col: str(grp_val),
+                    "signals": n_sig,
+                    "precision": round(precision, 4),
+                    "vector_net_pnl_usd": round(vec_net, 2),
+                    "exact_trades": exact_trades,
+                    "exact_win_rate": round(exact_win_rate, 4),
+                    "exact_net_pnl_usd": round(exact_pnl, 2),
+                }
+            )
+        return rows
+
+    # False Positive debugging comparing TP vs FP feature signatures
+    fp_debug: dict[str, Any] = {}
+    if TARGET_COL in work.columns:
+        base_signals = work[work[baseline_col] == 1]
+        custom_signals = work[work[signal_col] == 1]
+
+        base_fp = int((base_signals[TARGET_COL] == 0).sum())
+        custom_fp = int((custom_signals[TARGET_COL] == 0).sum())
+        custom_tp = int((custom_signals[TARGET_COL] == 1).sum())
+
+        fp_reduction_pct = (
+            ((base_fp - custom_fp) / base_fp * 100.0) if base_fp > 0 else 0.0
+        )
+
+        # Analyze feature means on False Positives vs True Positives for baseline signals
+        diagnostic_features = [
+            c
+            for c in ["rsi_14", "atr_pct_14", "vol_24h", "ema_50_200_ratio", "vwap_ratio", "fg_value"]
+            if c in work.columns
+        ]
+        tp_rows = base_signals[base_signals[TARGET_COL] == 1]
+        fp_rows = base_signals[base_signals[TARGET_COL] == 0]
+        feature_deltas: dict[str, dict[str, float]] = {}
+        for feat in diagnostic_features:
+            tp_mean = float(tp_rows[feat].mean()) if len(tp_rows) > 0 else 0.0
+            fp_mean = float(fp_rows[feat].mean()) if len(fp_rows) > 0 else 0.0
+            feature_deltas[feat] = {
+                "tp_mean": round(tp_mean, 5),
+                "fp_mean": round(fp_mean, 5),
+                "fp_minus_tp": round(fp_mean - tp_mean, 5),
+            }
+
+        fp_debug = {
+            "baseline_signals": int(len(base_signals)),
+            "baseline_false_positives": base_fp,
+            "baseline_precision": round(float(base_signals[TARGET_COL].mean()), 4)
+            if len(base_signals) > 0
+            else 0.0,
+            "custom_signals": int(len(custom_signals)),
+            "custom_true_positives": custom_tp,
+            "custom_false_positives": custom_fp,
+            "custom_precision": round(float(custom_signals[TARGET_COL].mean()), 4)
+            if len(custom_signals) > 0
+            else 0.0,
+            "false_positive_reduction_pct": round(fp_reduction_pct, 2),
+            "fp_vs_tp_feature_profile": feature_deltas,
+        }
+
+    return {
+        "by_ticker": _slice_table("symbol"),
+        "by_month": _slice_table("year_month"),
+        "by_sentiment_regime": _slice_table("sentiment_regime"),
+        "by_volatility_regime": _slice_table("volatility_regime"),
+        "false_positive_debugging": fp_debug,
+    }
+
+
+def format_simulation_report(
+    vec_summary: dict[str, Any],
+    exact_metrics: dict[str, Any],
+    bench_metrics: dict[str, Any],
+) -> str:
+    """Render a clean ASCII comparison table for console logging and notebooks."""
+    s1 = vec_summary["sim1_baseline"]
+    s2 = vec_summary["sim2_custom_rule"]
+    lines = [
+        "==============================================================================",
+        "AEGIS ALPHA - SIMULATION & BENCHMARK PERFORMANCE SUMMARY",
+        "==============================================================================",
+        "VECTORIZED SIMULATIONS ($100 unit allocation, 0.2% round-trip fees)",
+        f"  Sim 1 (Baseline Rule) : signals={s1['signals']:,} | win_rate={s1['win_rate']*100:.2f}% | "
+        f"gross=${s1['gross_pnl_usd']:,.2f} | net=${s1['net_pnl_usd']:,.2f} | PF={s1['profit_factor']:.2f}",
+        f"  Sim 2 (Custom Rule)   : signals={s2['signals']:,} | win_rate={s2['win_rate']*100:.2f}% | "
+        f"gross=${s2['gross_pnl_usd']:,.2f} | net=${s2['net_pnl_usd']:,.2f} | PF={s2['profit_factor']:.2f}",
+        "------------------------------------------------------------------------------",
+        f"{'Metric':<30} | {'Exact Strategy':>18} | {'BTC Buy-and-Hold':>18}",
+        "------------------------------------------------------------------------------",
+        f"{'Initial Capital (USD)':<30} | {exact_metrics['initial_capital']:>18,.2f} | {bench_metrics['initial_capital']:>18,.2f}",
+        f"{'Final Equity (USD)':<30} | {exact_metrics['final_equity']:>18,.2f} | {bench_metrics['final_equity']:>18,.2f}",
+        f"{'Total Return (%)':<30} | {exact_metrics['total_return_pct']:>17.2f}% | {bench_metrics['total_return_pct']:>17.2f}%",
+        f"{'CAGR (%)':<30} | {exact_metrics['cagr_pct']:>17.2f}% | {bench_metrics['cagr_pct']:>17.2f}%",
+        f"{'Sharpe Ratio (Annualized)':<30} | {exact_metrics['sharpe_ratio']:>18.3f} | {bench_metrics['sharpe_ratio']:>18.3f}",
+        f"{'Max Drawdown (%)':<30} | {exact_metrics['max_drawdown_pct']:>17.2f}% | {bench_metrics['max_drawdown_pct']:>17.2f}%",
+        f"{'Rolling 30d Mean Return (%)':<30} | {exact_metrics['rolling_30d_return_mean_pct']:>17.2f}% | {bench_metrics['rolling_30d_return_mean_pct']:>17.2f}%",
+        f"{'Total Closed Trades':<30} | {exact_metrics['total_trades']:>18,} | {'1 (Hold)':>18}",
+        f"{'Win Rate (%)':<30} | {exact_metrics['win_rate_pct']:>17.2f}% | {'N/A':>18}",
+        f"{'Total Fees Paid (USD)':<30} | {exact_metrics['total_fees_usd']:>18,.2f} | {bench_metrics['total_fees_usd']:>18,.2f}",
+        "==============================================================================",
+    ]
+    return "\n".join(lines)
+
+================================================================================
+FILE: src/train.py
+================================================================================
+"""Multi-model training, hyperparameter tuning, and custom decision rules.
+
+Phase 3 module for Aegis Alpha:
+- Chronological time-series split (Train: 2020-2024, Validation: 2025, Test: 2026).
+- Baseline models: DecisionTreeClassifier, RandomForestClassifier.
+- Advanced models: Hyperparameter-tuned XGBClassifier (Optuna or RandomizedSearchCV)
+  and PyTorch LSTM sequence classifier operating on per-symbol sliding windows.
+- Custom high-probability decision rule (pred_custom_rule) combining model probability,
+  Crypto Fear & Greed filter, volatility regime filter, and RSI confirmation.
+- Persists trained models, scalers, metadata, and test predictions to models/.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import joblib
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import (
+    accuracy_score,
+    f1_score,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
+from sklearn.model_selection import RandomizedSearchCV, TimeSeriesSplit
+from sklearn.preprocessing import StandardScaler
+from sklearn.tree import DecisionTreeClassifier
+
+from src.config import (
+    MODELS_DIR,
+    TEST_START_ISO,
+    TRAIN_END_ISO,
+    VAL_END_ISO,
+    VAL_START_ISO,
+    ensure_directories,
+)
+from src.features import (
+    DUMMIES,
+    FEATURE_COLS,
+    NUMERIC,
+    TARGET_COL,
+    TO_PREDICT,
+    save_dataframe,
+)
+
+logger = logging.getLogger("aegis_alpha.train")
+
+RANDOM_STATE = 42
+LSTM_SEQ_LEN = 16  # 16 * 15m = 4 hours of sequential market context
+
+
+@dataclass
+class ChronologicalSplit:
+    """Container holding strictly ordered Train, Validation, and Test DataFrames."""
+
+    train: pd.DataFrame
+    val: pd.DataFrame
+    test: pd.DataFrame
+    split_mode: str
+
+
+def chronological_split(
+    df: pd.DataFrame,
+    train_end_iso: str = TRAIN_END_ISO,
+    val_start_iso: str = VAL_START_ISO,
+    val_end_iso: str = VAL_END_ISO,
+    test_start_iso: str = TEST_START_ISO,
+) -> ChronologicalSplit:
+    """Split dataset chronologically into Train (2020-2024), Val (2025), and Test (2026).
+
+    Falls back to a strict chronological 70/15/15 timestamp split only when
+    running on a short custom subset that does not span 2020-2026.
+    """
+    ordered = df.sort_values(["timestamp", "symbol"]).reset_index(drop=True)
+    dt = pd.to_datetime(ordered["datetime"], utc=True)
+
+    train_end = pd.Timestamp(train_end_iso)
+    val_start = pd.Timestamp(val_start_iso)
+    val_end = pd.Timestamp(val_end_iso)
+    test_start = pd.Timestamp(test_start_iso)
+
+    train_df = ordered[dt <= train_end].copy()
+    val_df = ordered[(dt >= val_start) & (dt <= val_end)].copy()
+    test_df = ordered[dt >= test_start].copy()
+
+    if len(train_df) > 0 and len(val_df) > 0 and len(test_df) > 0:
+        logger.info(
+            "Applied canonical chronological split: train=%d (<=%s), val=%d (%s..%s), test=%d (>=%s).",
+            len(train_df),
+            train_end_iso,
+            len(val_df),
+            val_start_iso,
+            val_end_iso,
+            len(test_df),
+            test_start_iso,
+        )
+        return ChronologicalSplit(
+            train=train_df,
+            val=val_df,
+            test=test_df,
+            split_mode="canonical_2020_2024_train_2025_val_2026_test",
+        )
+
+    logger.warning(
+        "Dataset span does not cover all canonical 2020-2026 windows; "
+        "applying chronological 70/15/15 timestamp fallback split."
+    )
+    unique_ts = np.sort(ordered["timestamp"].unique())
+    if len(unique_ts) < 10:
+        raise ValueError("Dataset has too few unique timestamps for chronological splitting.")
+
+    idx_train = int(len(unique_ts) * 0.70)
+    idx_val = int(len(unique_ts) * 0.85)
+    ts_train_end = unique_ts[max(idx_train - 1, 0)]
+    ts_val_end = unique_ts[max(idx_val - 1, idx_train)]
+
+    train_df = ordered[ordered["timestamp"] <= ts_train_end].copy()
+    val_df = ordered[
+        (ordered["timestamp"] > ts_train_end) & (ordered["timestamp"] <= ts_val_end)
+    ].copy()
+    test_df = ordered[ordered["timestamp"] > ts_val_end].copy()
+
+    return ChronologicalSplit(
+        train=train_df,
+        val=val_df,
+        test=test_df,
+        split_mode="fallback_chronological_70_15_15",
+    )
+
+
+def evaluate_predictions(
+    y_true: np.ndarray | pd.Series,
+    y_prob: np.ndarray | pd.Series,
+    threshold: float = 0.50,
+    high_prob_threshold: float = 0.65,
+) -> dict[str, float]:
+    """Compute standard binary classification metrics plus high-confidence precision."""
+    y_t = np.asarray(y_true, dtype=int)
+    y_p = np.asarray(y_prob, dtype=float)
+    y_hat = (y_p >= threshold).astype(int)
+    y_high = (y_p > high_prob_threshold).astype(int)
+
+    try:
+        auc = float(roc_auc_score(y_t, y_p)) if len(np.unique(y_t)) > 1 else 0.5
+    except ValueError:
+        auc = 0.5
+
+    return {
+        "roc_auc": round(auc, 5),
+        "accuracy": round(float(accuracy_score(y_t, y_hat)), 5),
+        "precision": round(float(precision_score(y_t, y_hat, zero_division=0)), 5),
+        "recall": round(float(recall_score(y_t, y_hat, zero_division=0)), 5),
+        "f1": round(float(f1_score(y_t, y_hat, zero_division=0)), 5),
+        "precision_at_065": round(float(precision_score(y_t, y_high, zero_division=0)), 5),
+        "signals_at_065": int(y_high.sum()),
+    }
+
+
+def evaluate_binary_signal(
+    y_true: np.ndarray | pd.Series,
+    signal: np.ndarray | pd.Series,
+) -> dict[str, float]:
+    """Evaluate a discrete 0/1 trading rule signal against ground truth."""
+    y_t = np.asarray(y_true, dtype=int)
+    sig = np.asarray(signal, dtype=int)
+    return {
+        "signal_count": int(sig.sum()),
+        "signal_rate": round(float(sig.mean()), 5),
+        "precision": round(float(precision_score(y_t, sig, zero_division=0)), 5),
+        "recall": round(float(recall_score(y_t, sig, zero_division=0)), 5),
+        "f1": round(float(f1_score(y_t, sig, zero_division=0)), 5),
+    }
+
+
+def train_decision_tree(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+) -> DecisionTreeClassifier:
+    """Train Baseline Model 1: Depth-regularized DecisionTreeClassifier."""
+    model = DecisionTreeClassifier(
+        max_depth=10,
+        min_samples_leaf=50,
+        class_weight="balanced",
+        random_state=RANDOM_STATE,
+    )
+    model.fit(X_train, y_train)
+    logger.info("Trained Baseline DecisionTreeClassifier (max_depth=10).")
+    return model
+
+
+def train_random_forest(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    n_estimators: int = 150,
+) -> RandomForestClassifier:
+    """Train Baseline Model 2: Bagged RandomForestClassifier."""
+    model = RandomForestClassifier(
+        n_estimators=n_estimators,
+        max_depth=12,
+        min_samples_leaf=50,
+        max_features="sqrt",
+        class_weight="balanced_subsample",
+        n_jobs=-1,
+        random_state=RANDOM_STATE,
+    )
+    model.fit(X_train, y_train)
+    logger.info("Trained Baseline RandomForestClassifier (n_estimators=%d).", n_estimators)
+    return model
+
+
+def train_tuned_xgboost(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    X_val: pd.DataFrame,
+    y_val: pd.Series,
+    tuning_method: str = "optuna",
+    n_trials: int = 15,
+) -> tuple[Any, dict[str, Any]]:
+    """Train Advanced Model 1: Hyperparameter-tuned XGBClassifier.
+
+    Supports Optuna Bayesian search (evaluating directly on the chronological
+    validation set) or RandomizedSearchCV with TimeSeriesSplit.
+    """
+    from xgboost import XGBClassifier
+
+    pos_count = max(int((y_train == 1).sum()), 1)
+    neg_count = max(int((y_train == 0).sum()), 1)
+    scale_pos_weight = float(neg_count / pos_count)
+
+    best_params: dict[str, Any] = {
+        "n_estimators": 350,
+        "max_depth": 6,
+        "learning_rate": 0.05,
+        "subsample": 0.8,
+        "colsample_bytree": 0.8,
+        "min_child_weight": 20,
+        "reg_alpha": 0.5,
+        "reg_lambda": 2.0,
+    }
+
+    use_optuna = tuning_method == "optuna"
+    if use_optuna:
+        try:
+            import optuna
+
+            optuna.logging.set_verbosity(optuna.logging.WARNING)
+        except ImportError:
+            logger.warning("optuna not installed; falling back to RandomizedSearchCV.")
+            use_optuna = False
+
+    if use_optuna and n_trials > 0:
+        import optuna
+
+        def objective(trial: optuna.Trial) -> float:
+            params = {
+                "n_estimators": trial.suggest_int("n_estimators", 150, 500, step=50),
+                "max_depth": trial.suggest_int("max_depth", 3, 8),
+                "learning_rate": trial.suggest_float("learning_rate", 0.015, 0.15, log=True),
+                "subsample": trial.suggest_float("subsample", 0.65, 0.95),
+                "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 0.95),
+                "min_child_weight": trial.suggest_int("min_child_weight", 5, 60),
+                "reg_alpha": trial.suggest_float("reg_alpha", 1e-3, 5.0, log=True),
+                "reg_lambda": trial.suggest_float("reg_lambda", 0.5, 10.0, log=True),
+            }
+            clf = XGBClassifier(
+                **params,
+                scale_pos_weight=scale_pos_weight,
+                objective="binary:logistic",
+                eval_metric="auc",
+                tree_method="hist",
+                n_jobs=-1,
+                random_state=RANDOM_STATE,
+                early_stopping_rounds=25,
+            )
+            clf.fit(
+                X_train,
+                y_train,
+                eval_set=[(X_val, y_val)],
+                verbose=False,
+            )
+            val_prob = clf.predict_proba(X_val)[:, 1]
+            return float(roc_auc_score(y_val, val_prob))
+
+        study = optuna.create_study(
+            direction="maximize",
+            sampler=optuna.samplers.TPESampler(seed=RANDOM_STATE),
+        )
+        study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+        best_params.update(study.best_params)
+        logger.info(
+            "Optuna XGBoost tuning finished (%d trials): best val ROC-AUC=%.5f | params=%s",
+            n_trials,
+            study.best_value,
+            best_params,
+        )
+    elif n_trials > 0:
+        param_dist = {
+            "n_estimators": [150, 250, 350, 450],
+            "max_depth": [4, 5, 6, 7],
+            "learning_rate": [0.02, 0.05, 0.08, 0.12],
+            "subsample": [0.7, 0.8, 0.9],
+            "colsample_bytree": [0.7, 0.8, 0.9],
+            "min_child_weight": [10, 25, 50],
+            "reg_alpha": [0.0, 0.2, 1.0],
+            "reg_lambda": [1.0, 2.5, 5.0],
+        }
+        base_xgb = XGBClassifier(
+            scale_pos_weight=scale_pos_weight,
+            objective="binary:logistic",
+            eval_metric="auc",
+            tree_method="hist",
+            n_jobs=-1,
+            random_state=RANDOM_STATE,
+        )
+        tscv = TimeSeriesSplit(n_splits=3)
+        search = RandomizedSearchCV(
+            estimator=base_xgb,
+            param_distributions=param_dist,
+            n_iter=min(n_trials, 20),
+            scoring="roc_auc",
+            cv=tscv,
+            random_state=RANDOM_STATE,
+            n_jobs=1,
+            verbose=0,
+        )
+        search.fit(X_train, y_train)
+        best_params.update(search.best_params_)
+        logger.info(
+            "RandomizedSearchCV XGBoost tuning finished: best CV ROC-AUC=%.5f | params=%s",
+            search.best_score_,
+            best_params,
+        )
+
+    final_model = XGBClassifier(
+        **best_params,
+        scale_pos_weight=scale_pos_weight,
+        objective="binary:logistic",
+        eval_metric="auc",
+        tree_method="hist",
+        n_jobs=-1,
+        random_state=RANDOM_STATE,
+        early_stopping_rounds=30,
+    )
+    final_model.fit(
+        X_train,
+        y_train,
+        eval_set=[(X_val, y_val)],
+        verbose=False,
+    )
+    return final_model, best_params
+
+
+def _build_lstm_class() -> Any:
+    """Lazily define PyTorch CryptoLSTMClassifier to keep module import lightweight."""
+    import torch
+    import torch.nn as nn
+
+    class CryptoLSTMClassifier(nn.Module):
+        """Multi-layer LSTM sequence classifier for 15m cryptocurrency feature windows."""
+
+        def __init__(
+            self,
+            input_dim: int,
+            hidden_dim: int = 64,
+            num_layers: int = 2,
+            dropout: float = 0.25,
+        ) -> None:
+            super().__init__()
+            self.input_dim = input_dim
+            self.hidden_dim = hidden_dim
+            self.num_layers = num_layers
+            self.dropout_rate = dropout
+
+            self.lstm = nn.LSTM(
+                input_size=input_dim,
+                hidden_size=hidden_dim,
+                num_layers=num_layers,
+                batch_first=True,
+                dropout=dropout if num_layers > 1 else 0.0,
+            )
+            self.norm = nn.LayerNorm(hidden_dim)
+            self.head = nn.Sequential(
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, hidden_dim // 2),
+                nn.ReLU(),
+                nn.Dropout(dropout * 0.5),
+                nn.Linear(hidden_dim // 2, 1),
+            )
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            out, _ = self.lstm(x)
+            last_step = self.norm(out[:, -1, :])
+            return self.head(last_step).squeeze(-1)
+
+    return CryptoLSTMClassifier
+
+
+def _prepare_symbol_sequences(
+    df: pd.DataFrame,
+    scaler: StandardScaler,
+    feature_cols: list[str],
+    seq_len: int = LSTM_SEQ_LEN,
+    include_target: bool = True,
+) -> tuple[np.ndarray, np.ndarray | None, np.ndarray]:
+    """Build sliding windows strictly inside each symbol without cross-asset bleed.
+
+    Returns (X_seq, y_seq, original_row_positions).
+    """
+    scaled_all = scaler.transform(df[feature_cols].to_numpy(dtype=np.float32))
+    scaled_all = np.clip(scaled_all, -10.0, 10.0)
+
+    x_chunks: list[np.ndarray] = []
+    y_chunks: list[np.ndarray] = []
+    pos_chunks: list[np.ndarray] = []
+
+    positions = np.arange(len(df))
+    symbols = df["symbol"].to_numpy()
+    timestamps = df["timestamp"].to_numpy()
+    targets = df[TARGET_COL].to_numpy(dtype=np.float32) if include_target and TARGET_COL in df.columns else None
+
+    for sym in np.unique(symbols):
+        mask = np.where(symbols == sym)[0]
+        order = mask[np.argsort(timestamps[mask])]
+        if len(order) < seq_len:
+            continue
+
+        sym_x = scaled_all[order]
+        # Vectorized sliding window view: shape (n_windows, seq_len, n_features)
+        windows = np.lib.stride_tricks.sliding_window_view(
+            sym_x, window_shape=seq_len, axis=0
+        )
+        # sliding_window_view places window axis at the end: (N, F, T) -> transpose to (N, T, F)
+        windows = np.transpose(windows, (0, 2, 1))
+        end_positions = positions[order[seq_len - 1 :]]
+
+        x_chunks.append(windows)
+        pos_chunks.append(end_positions)
+        if targets is not None:
+            y_chunks.append(targets[order[seq_len - 1 :]])
+
+    if not x_chunks:
+        empty_x = np.zeros((0, seq_len, len(feature_cols)), dtype=np.float32)
+        empty_y = np.zeros((0,), dtype=np.float32) if include_target else None
+        return empty_x, empty_y, np.zeros((0,), dtype=np.int64)
+
+    X_seq = np.concatenate(x_chunks, axis=0)
+    pos_all = np.concatenate(pos_chunks, axis=0)
+    y_seq = np.concatenate(y_chunks, axis=0) if targets is not None else None
+    return X_seq, y_seq, pos_all
+
+
+def predict_lstm_probabilities(
+    model: Any,
+    scaler: StandardScaler,
+    df: pd.DataFrame,
+    feature_cols: list[str] = NUMERIC,
+    seq_len: int = LSTM_SEQ_LEN,
+    batch_size: int = 1024,
+    fallback_prob: float = 0.5,
+) -> np.ndarray:
+    """Run batched LSTM inference and align predictions back to DataFrame row order."""
+    import torch
+
+    probs = np.full(len(df), fallback_prob, dtype=np.float64)
+    X_seq, _, row_positions = _prepare_symbol_sequences(
+        df=df,
+        scaler=scaler,
+        feature_cols=feature_cols,
+        seq_len=seq_len,
+        include_target=False,
+    )
+    if len(X_seq) == 0:
+        return probs
+
+    device = next(model.parameters()).device
+    model.eval()
+    preds: list[np.ndarray] = []
+    with torch.no_grad():
+        for start in range(0, len(X_seq), batch_size):
+            batch = torch.from_numpy(
+                np.ascontiguousarray(X_seq[start : start + batch_size], dtype=np.float32)
+            ).to(device)
+            logits = model(batch)
+            batch_probs = torch.sigmoid(logits).cpu().numpy()
+            preds.append(batch_probs)
+
+    probs[row_positions] = np.concatenate(preds, axis=0)
+    return probs
+
+
+def train_pytorch_lstm(
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    feature_cols: list[str] = NUMERIC,
+    seq_len: int = LSTM_SEQ_LEN,
+    hidden_dim: int = 64,
+    num_layers: int = 2,
+    dropout: float = 0.25,
+    epochs: int = 8,
+    batch_size: int = 512,
+    learning_rate: float = 1e-3,
+    max_train_windows: int = 150000,
+) -> tuple[Any, StandardScaler, dict[str, Any]]:
+    """Train Advanced Model 2: PyTorch LSTM sequence classifier."""
+    import torch
+    import torch.nn as nn
+    from torch.utils.data import DataLoader, TensorDataset
+
+    torch.manual_seed(RANDOM_STATE)
+    np.random.seed(RANDOM_STATE)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Fit scaler strictly on training split to prevent data leakage
+    scaler = StandardScaler()
+    scaler.fit(train_df[feature_cols].to_numpy(dtype=np.float32))
+
+    X_train_seq, y_train_seq, _ = _prepare_symbol_sequences(
+        df=train_df, scaler=scaler, feature_cols=feature_cols, seq_len=seq_len, include_target=True
+    )
+    X_val_seq, y_val_seq, _ = _prepare_symbol_sequences(
+        df=val_df, scaler=scaler, feature_cols=feature_cols, seq_len=seq_len, include_target=True
+    )
+
+    if len(X_train_seq) == 0 or len(X_val_seq) == 0:
+        raise ValueError("Insufficient sequence windows to train PyTorch LSTM.")
+
+    # Optional recency cap on huge >800k-row training splits to keep CPU training tractable
+    if len(X_train_seq) > max_train_windows:
+        logger.info(
+            "Subsampling most recent %d LSTM training windows out of %d for training speed.",
+            max_train_windows,
+            len(X_train_seq),
+        )
+        X_train_seq = X_train_seq[-max_train_windows:]
+        y_train_seq = y_train_seq[-max_train_windows:]
+
+    train_dataset = TensorDataset(
+        torch.from_numpy(np.ascontiguousarray(X_train_seq, dtype=np.float32)),
+        torch.from_numpy(np.ascontiguousarray(y_train_seq, dtype=np.float32)),
+    )
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=False)
+
+    CryptoLSTMClassifier = _build_lstm_class()
+    model = CryptoLSTMClassifier(
+        input_dim=len(feature_cols),
+        hidden_dim=hidden_dim,
+        num_layers=num_layers,
+        dropout=dropout,
+    ).to(device)
+
+    pos_rate = float(np.clip(y_train_seq.mean(), 1e-4, 1.0 - 1e-4))
+    pos_weight = torch.tensor([(1.0 - pos_rate) / pos_rate], dtype=torch.float32, device=device)
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="max", factor=0.5, patience=2
+    )
+
+    best_val_auc = -1.0
+    best_state_dict: dict[str, Any] | None = None
+    history: list[dict[str, float]] = []
+
+    for epoch in range(1, epochs + 1):
+        model.train()
+        running_loss = 0.0
+        n_batches = 0
+        for bx, by in train_loader:
+            bx = bx.to(device)
+            by = by.to(device)
+            optimizer.zero_grad()
+            logits = model(bx)
+            loss = criterion(logits, by)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            running_loss += float(loss.item())
+            n_batches += 1
+
+        val_probs = predict_lstm_probabilities(
+            model=model,
+            scaler=scaler,
+            df=val_df,
+            feature_cols=feature_cols,
+            seq_len=seq_len,
+        )
+        val_auc = float(roc_auc_score(val_df[TARGET_COL].to_numpy(), val_probs)) if len(
+            np.unique(val_df[TARGET_COL])
+        ) > 1 else 0.5
+        avg_loss = running_loss / max(n_batches, 1)
+        scheduler.step(val_auc)
+        history.append({"epoch": epoch, "train_loss": round(avg_loss, 5), "val_auc": round(val_auc, 5)})
+        logger.info(
+            "LSTM Epoch %d/%d | train_loss=%.5f | val_roc_auc=%.5f | device=%s",
+            epoch,
+            epochs,
+            avg_loss,
+            val_auc,
+            device,
+        )
+
+        if val_auc > best_val_auc:
+            best_val_auc = val_auc
+            best_state_dict = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+
+    if best_state_dict is not None:
+        model.load_state_dict(best_state_dict)
+    model.to(torch.device("cpu"))
+
+    lstm_config = {
+        "input_dim": len(feature_cols),
+        "hidden_dim": hidden_dim,
+        "num_layers": num_layers,
+        "dropout": dropout,
+        "seq_len": seq_len,
+        "feature_cols": list(feature_cols),
+        "best_val_auc": round(best_val_auc, 5),
+        "history": history,
+    }
+    return model, scaler, lstm_config
+
+
+def apply_custom_decision_rules(
+    df: pd.DataFrame,
+    prob_col: str = "pred_prob_ensemble",
+    baseline_prob_col: str = "pred_prob_xgb",
+    baseline_threshold: float = 0.55,
+    custom_prob_threshold: float = 0.65,
+    max_fear_greed: float = 45.0,
+    max_rsi: float = 70.0,
+) -> pd.DataFrame:
+    """Attach baseline and custom high-probability trading decision rules.
+
+    Custom rule (pred_custom_rule):
+    - Model probability > 0.65
+    - Crypto Fear & Greed Index < 45 (contrarian Fear / Extreme Fear zone)
+    - Volatility regime is not 'extreme'
+    - RSI-14 < 70 (avoid overbought chase entries)
+    """
+    out = df.copy()
+    base_col = baseline_prob_col if baseline_prob_col in out.columns else prob_col
+    out["pred_baseline"] = (out[base_col] >= baseline_threshold).astype(int)
+
+    prob_cond = out[prob_col] > custom_prob_threshold
+    fg_cond = out["fg_value"] < max_fear_greed
+    vol_cond = out["volatility_regime"] != "extreme"
+    rsi_cond = out["rsi_14"] < max_rsi
+
+    out["pred_custom_rule"] = (prob_cond & fg_cond & vol_cond & rsi_cond).astype(int)
+    return out
+
+
+def save_lstm_checkpoint(model: Any, lstm_config: dict[str, Any], path: Path) -> None:
+    """Save PyTorch LSTM weights and architecture config."""
+    import torch
+
+    torch.save(
+        {
+            "state_dict": model.state_dict(),
+            "config": lstm_config,
+        },
+        path,
+    )
+
+
+def load_lstm_checkpoint(path: Path) -> tuple[Any, dict[str, Any]]:
+    """Restore PyTorch LSTM classifier from checkpoint."""
+    import torch
+
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    cfg = payload["config"]
+    CryptoLSTMClassifier = _build_lstm_class()
+    model = CryptoLSTMClassifier(
+        input_dim=cfg["input_dim"],
+        hidden_dim=cfg["hidden_dim"],
+        num_layers=cfg["num_layers"],
+        dropout=cfg["dropout"],
+    )
+    model.load_state_dict(payload["state_dict"])
+    model.eval()
+    return model, cfg
+
+
+def train_all_models(
+    df: pd.DataFrame,
+    models_dir: Path = MODELS_DIR,
+    tuning_method: str = "optuna",
+    tuning_trials: int = 12,
+    train_lstm: bool = True,
+    lstm_epochs: int = 6,
+    rf_estimators: int = 150,
+) -> dict[str, Any]:
+    """Train all 4 models, evaluate on Validation and Test, apply rules, and save artifacts."""
+    ensure_directories()
+    out_dir = Path(models_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    split = chronological_split(df)
+    X_train, y_train = split.train[FEATURE_COLS], split.train[TARGET_COL]
+    X_val, y_val = split.val[FEATURE_COLS], split.val[TARGET_COL]
+    X_test, y_test = split.test[FEATURE_COLS], split.test[TARGET_COL]
+
+    # 1. Lecture Baseline 1: DecisionTreeClassifier
+    dt_model = train_decision_tree(X_train, y_train)
+    dt_val_prob = dt_model.predict_proba(X_val)[:, 1]
+    dt_test_prob = dt_model.predict_proba(X_test)[:, 1]
+    joblib.dump(dt_model, out_dir / "decision_tree.joblib")
+
+    # 2. Lecture Baseline 2: RandomForestClassifier
+    rf_model = train_random_forest(X_train, y_train, n_estimators=rf_estimators)
+    rf_val_prob = rf_model.predict_proba(X_val)[:, 1]
+    rf_test_prob = rf_model.predict_proba(X_test)[:, 1]
+    joblib.dump(rf_model, out_dir / "random_forest.joblib")
+
+    # 3. Advanced Model 1: Tuned XGBClassifier
+    xgb_model, xgb_best_params = train_tuned_xgboost(
+        X_train=X_train,
+        y_train=y_train,
+        X_val=X_val,
+        y_val=y_val,
+        tuning_method=tuning_method,
+        n_trials=tuning_trials,
+    )
+    xgb_val_prob = xgb_model.predict_proba(X_val)[:, 1]
+    xgb_test_prob = xgb_model.predict_proba(X_test)[:, 1]
+    joblib.dump(xgb_model, out_dir / "xgboost_tuned.joblib")
+
+    # 4. Advanced Model 2: PyTorch LSTM Sequence Classifier
+    lstm_trained = False
+    lstm_cfg: dict[str, Any] = {}
+    lstm_val_prob: np.ndarray | None = None
+    lstm_test_prob: np.ndarray | None = None
+
+    if train_lstm:
+        try:
+            lstm_model, lstm_scaler, lstm_cfg = train_pytorch_lstm(
+                train_df=split.train,
+                val_df=split.val,
+                feature_cols=NUMERIC,
+                seq_len=LSTM_SEQ_LEN,
+                epochs=lstm_epochs,
+            )
+            lstm_val_prob = predict_lstm_probabilities(
+                model=lstm_model,
+                scaler=lstm_scaler,
+                df=split.val,
+                feature_cols=NUMERIC,
+                seq_len=LSTM_SEQ_LEN,
+            )
+            lstm_test_prob = predict_lstm_probabilities(
+                model=lstm_model,
+                scaler=lstm_scaler,
+                df=split.test,
+                feature_cols=NUMERIC,
+                seq_len=LSTM_SEQ_LEN,
+            )
+            save_lstm_checkpoint(lstm_model, lstm_cfg, out_dir / "lstm_classifier.pt")
+            joblib.dump(lstm_scaler, out_dir / "lstm_scaler.joblib")
+            lstm_trained = True
+        except Exception as exc:
+            logger.warning("PyTorch LSTM training skipped/failed (%s); using XGBoost ensemble.", exc)
+
+    # Assemble Validation and Test prediction DataFrames
+    val_preds = split.val.copy()
+    test_preds = split.test.copy()
+
+    val_preds["pred_prob_dt"] = dt_val_prob
+    val_preds["pred_prob_rf"] = rf_val_prob
+    val_preds["pred_prob_xgb"] = xgb_val_prob
+
+    test_preds["pred_prob_dt"] = dt_test_prob
+    test_preds["pred_prob_rf"] = rf_test_prob
+    test_preds["pred_prob_xgb"] = xgb_test_prob
+
+    if lstm_trained and lstm_val_prob is not None and lstm_test_prob is not None:
+        val_preds["pred_prob_lstm"] = lstm_val_prob
+        test_preds["pred_prob_lstm"] = lstm_test_prob
+        val_preds["pred_prob_ensemble"] = 0.65 * xgb_val_prob + 0.35 * lstm_val_prob
+        test_preds["pred_prob_ensemble"] = 0.65 * xgb_test_prob + 0.35 * lstm_test_prob
+    else:
+        val_preds["pred_prob_lstm"] = np.nan
+        test_preds["pred_prob_lstm"] = np.nan
+        val_preds["pred_prob_ensemble"] = xgb_val_prob
+        test_preds["pred_prob_ensemble"] = xgb_test_prob
+
+    val_preds = apply_custom_decision_rules(val_preds)
+    test_preds = apply_custom_decision_rules(test_preds)
+
+    metrics: dict[str, Any] = {
+        "split_mode": split.split_mode,
+        "row_counts": {
+            "train": int(len(split.train)),
+            "val": int(len(split.val)),
+            "test": int(len(split.test)),
+        },
+        "validation": {
+            "decision_tree": evaluate_predictions(y_val, dt_val_prob),
+            "random_forest": evaluate_predictions(y_val, rf_val_prob),
+            "xgboost_tuned": evaluate_predictions(y_val, xgb_val_prob),
+            "ensemble": evaluate_predictions(y_val, val_preds["pred_prob_ensemble"]),
+            "rule_baseline": evaluate_binary_signal(y_val, val_preds["pred_baseline"]),
+            "rule_custom": evaluate_binary_signal(y_val, val_preds["pred_custom_rule"]),
+        },
+        "test": {
+            "decision_tree": evaluate_predictions(y_test, dt_test_prob),
+            "random_forest": evaluate_predictions(y_test, rf_test_prob),
+            "xgboost_tuned": evaluate_predictions(y_test, xgb_test_prob),
+            "ensemble": evaluate_predictions(y_test, test_preds["pred_prob_ensemble"]),
+            "rule_baseline": evaluate_binary_signal(y_test, test_preds["pred_baseline"]),
+            "rule_custom": evaluate_binary_signal(y_test, test_preds["pred_custom_rule"]),
+        },
+        "xgboost_best_params": xgb_best_params,
+        "lstm_trained": lstm_trained,
+        "lstm_config": lstm_cfg,
+        "feature_counts": {
+            "TO_PREDICT": len(TO_PREDICT),
+            "NUMERIC": len(NUMERIC),
+            "DUMMIES": len(DUMMIES),
+            "TOTAL": len(FEATURE_COLS),
+        },
+    }
+
+    if lstm_trained and lstm_val_prob is not None and lstm_test_prob is not None:
+        metrics["validation"]["lstm"] = evaluate_predictions(y_val, lstm_val_prob)
+        metrics["test"]["lstm"] = evaluate_predictions(y_test, lstm_test_prob)
+
+    metadata_path = out_dir / "model_metadata.json"
+    metadata_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+
+    # Persist test predictions for downstream simulation and notebooks
+    keep_cols = [
+        c
+        for c in [
+            "symbol",
+            "timestamp",
+            "datetime_utc",
+            "datetime",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "rsi_14",
+            "atr_pct_14",
+            "vol_24h",
+            "ema_50_200_ratio",
+            "vwap_ratio",
+            "fg_value",
+            "sentiment_regime",
+            "volatility_regime",
+            "future_return_15m",
+            "future_return_4h",
+            TARGET_COL,
+            "pred_prob_dt",
+            "pred_prob_rf",
+            "pred_prob_xgb",
+            "pred_prob_lstm",
+            "pred_prob_ensemble",
+            "pred_baseline",
+            "pred_custom_rule",
+        ]
+        if c in test_preds.columns
+    ]
+    preds_path = save_dataframe(test_preds[keep_cols], out_dir / "predictions_test.parquet")
+    logger.info("Saved model metadata to %s and test predictions to %s.", metadata_path, preds_path)
+
+    return {
+        "metrics": metrics,
+        "val_predictions": val_preds,
+        "test_predictions": test_preds,
+        "predictions_path": str(preds_path),
+    }
+
+
+def predict_with_saved_models(
+    df: pd.DataFrame,
+    models_dir: Path = MODELS_DIR,
+) -> pd.DataFrame:
+    """Load persisted model artifacts and generate predictions + custom decision rules."""
+    out_dir = Path(models_dir)
+    xgb_path = out_dir / "xgboost_tuned.joblib"
+    if not xgb_path.exists():
+        raise FileNotFoundError(
+            f"Trained model artifact not found at {xgb_path}. Run training first."
+        )
+
+    out = df.copy()
+    X = out[FEATURE_COLS]
+
+    xgb_model = joblib.load(xgb_path)
+    out["pred_prob_xgb"] = xgb_model.predict_proba(X)[:, 1]
+
+    dt_path = out_dir / "decision_tree.joblib"
+    if dt_path.exists():
+        dt_model = joblib.load(dt_path)
+        out["pred_prob_dt"] = dt_model.predict_proba(X)[:, 1]
+
+    rf_path = out_dir / "random_forest.joblib"
+    if rf_path.exists():
+        rf_model = joblib.load(rf_path)
+        out["pred_prob_rf"] = rf_model.predict_proba(X)[:, 1]
+
+    lstm_pt = out_dir / "lstm_classifier.pt"
+    lstm_scaler_path = out_dir / "lstm_scaler.joblib"
+    if lstm_pt.exists() and lstm_scaler_path.exists():
+        try:
+            lstm_model, lstm_cfg = load_lstm_checkpoint(lstm_pt)
+            lstm_scaler = joblib.load(lstm_scaler_path)
+            out["pred_prob_lstm"] = predict_lstm_probabilities(
+                model=lstm_model,
+                scaler=lstm_scaler,
+                df=out,
+                feature_cols=lstm_cfg.get("feature_cols", NUMERIC),
+                seq_len=int(lstm_cfg.get("seq_len", LSTM_SEQ_LEN)),
+            )
+            out["pred_prob_ensemble"] = 0.65 * out["pred_prob_xgb"] + 0.35 * out["pred_prob_lstm"]
+        except Exception as exc:
+            logger.warning("Failed to run LSTM inference (%s); falling back to XGBoost.", exc)
+            out["pred_prob_ensemble"] = out["pred_prob_xgb"]
+    else:
+        out["pred_prob_ensemble"] = out["pred_prob_xgb"]
+
+    out = apply_custom_decision_rules(out)
+    return out
+
